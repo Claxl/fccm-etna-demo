@@ -474,6 +474,26 @@ def _run_and_stream():
                 )
                 render_kpi(level_slot, "Level", f"L{evt.level} @ {evt.level_size}px")
 
+                # Transition frame: show the new level's pre-warp overlay
+                # upscaled to ref_size so the user sees the jump to a new
+                # pyramid resolution before any registration step runs.
+                lvl_info = per_level.get(active_level, {})
+                lvl_ref = lvl_info.get("ref_img")
+                lvl_mov = lvl_info.get("moving_img")
+                lvl_size = int(lvl_info.get("size") or 0)
+                if lvl_ref is not None and lvl_mov is not None and lvl_size > 0:
+                    fused_trans = make_fusion(lvl_ref, lvl_mov)
+                    display_trans = cv2.resize(
+                        fused_trans, (ref_size, ref_size),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                    overlay_slot.image(
+                        annotate(display_trans,
+                                 f"entering L{active_level} @ {lvl_size}px",
+                                 level_bgr(active_level)),
+                        channels="BGR", use_container_width=True,
+                    )
+
         elif isinstance(evt, MetricEvent):
             total_evals += 1
             lvl = max(0, min(num_levels - 1, evt.level))
@@ -492,13 +512,37 @@ def _run_and_stream():
                 ui_last_refresh = now
 
                 # Live overlay (expensive) — only every Nth eval.
+                # Show the fixed ⊕ warped fusion at the CURRENT pyramid
+                # level and upscale the result to ref_size with nearest-
+                # neighbor interpolation, so the frame size is stable while
+                # the visible "resolution" reflects which layer is running.
                 if total_evals % overlay_refresh_every == 0:
-                    warped_live = warp_affine(moving_img, last_transform,
-                                              out_size=(ref_size, ref_size))
+                    level_info = per_level.get(lvl, {})
+                    level_ref = level_info.get("ref_img")
+                    level_mov = level_info.get("moving_img")
+                    level_size = int(level_info.get("size") or 0)
+                    if (level_ref is not None and level_mov is not None
+                            and level_size > 0):
+                        warped_level = warp_affine(
+                            level_mov, last_transform,
+                            out_size=(level_size, level_size),
+                        )
+                        fused_level = make_fusion(level_ref, warped_level)
+                        display_img = cv2.resize(
+                            fused_level, (ref_size, ref_size),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                        caption = (f"live overlay - L{lvl} @ {level_size}px "
+                                   f"| eval {total_evals}")
+                    else:
+                        warped_live = warp_affine(
+                            moving_img, last_transform,
+                            out_size=(ref_size, ref_size),
+                        )
+                        display_img = make_fusion(fixed_img, warped_live)
+                        caption = f"live overlay - L{lvl} | eval {total_evals}"
                     overlay_slot.image(
-                        annotate(make_fusion(fixed_img, warped_live),
-                                 f"live overlay - L{lvl} | eval {total_evals}",
-                                 level_bgr(lvl)),
+                        annotate(display_img, caption, level_bgr(lvl)),
                         channels="BGR", use_container_width=True,
                     )
 
