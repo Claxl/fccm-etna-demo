@@ -312,6 +312,25 @@ def render_kpi(slot, label: str, value: str, color: str = "#fff") -> None:
     )
 
 
+def pad_to_frame(img: np.ndarray, frame_size: int) -> np.ndarray:
+    """Center ``img`` on a ``frame_size × frame_size`` black canvas.
+
+    Keeps the native pixel size of a pyramid level visible in the UI
+    (no upscaling artefacts) while holding the display frame stable.
+    """
+    h, w = img.shape[:2]
+    if h >= frame_size and w >= frame_size:
+        return img[:frame_size, :frame_size]
+    if img.ndim == 2:
+        canvas = np.zeros((frame_size, frame_size), dtype=img.dtype)
+    else:
+        canvas = np.zeros((frame_size, frame_size, img.shape[2]), dtype=img.dtype)
+    y_off = max(0, (frame_size - h) // 2)
+    x_off = max(0, (frame_size - w) // 2)
+    canvas[y_off:y_off + h, x_off:x_off + w] = img
+    return canvas
+
+
 # Initial state for the live slots.
 ladder_slot.markdown(render_ladder(-1, num_levels), unsafe_allow_html=True)
 matrix_slot.markdown(render_matrix(np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)),
@@ -474,21 +493,31 @@ def _run_and_stream():
                 )
                 render_kpi(level_slot, "Level", f"L{evt.level} @ {evt.level_size}px")
 
-                # Transition frame: show the new level's pre-warp overlay
-                # upscaled to ref_size so the user sees the jump to a new
-                # pyramid resolution before any registration step runs.
+                # Transition frame: refresh all three top panels with the
+                # new level's native-size images centered inside the
+                # ``ref_size`` frame with black padding. No upscaling — the
+                # shrinking visible image size makes the jump between
+                # pyramid levels explicit.
                 lvl_info = per_level.get(active_level, {})
                 lvl_ref = lvl_info.get("ref_img")
                 lvl_mov = lvl_info.get("moving_img")
                 lvl_size = int(lvl_info.get("size") or 0)
                 if lvl_ref is not None and lvl_mov is not None and lvl_size > 0:
-                    fused_trans = make_fusion(lvl_ref, lvl_mov)
-                    display_trans = cv2.resize(
-                        fused_trans, (ref_size, ref_size),
-                        interpolation=cv2.INTER_NEAREST,
+                    fixed_slot.image(
+                        annotate(pad_to_frame(lvl_ref, ref_size),
+                                 f"Fixed @ L{active_level} - {lvl_size}px",
+                                 (180, 180, 180)),
+                        channels="BGR", use_container_width=True,
                     )
+                    moving_slot.image(
+                        annotate(pad_to_frame(lvl_mov, ref_size),
+                                 f"Moving @ L{active_level} - {lvl_size}px",
+                                 (0, 128, 255)),
+                        channels="BGR", use_container_width=True,
+                    )
+                    fused_trans = make_fusion(lvl_ref, lvl_mov)
                     overlay_slot.image(
-                        annotate(display_trans,
+                        annotate(pad_to_frame(fused_trans, ref_size),
                                  f"entering L{active_level} @ {lvl_size}px",
                                  level_bgr(active_level)),
                         channels="BGR", use_container_width=True,
@@ -512,10 +541,11 @@ def _run_and_stream():
                 ui_last_refresh = now
 
                 # Live overlay (expensive) — only every Nth eval.
-                # Show the fixed ⊕ warped fusion at the CURRENT pyramid
-                # level and upscale the result to ref_size with nearest-
-                # neighbor interpolation, so the frame size is stable while
-                # the visible "resolution" reflects which layer is running.
+                # Warp/fuse at the current pyramid level's native size, then
+                # center the small result on a ref_size × ref_size black
+                # canvas. The frame is stable; the visible image actually
+                # shrinks at coarser levels so the user sees how low the
+                # effective resolution is while ETNA works on each layer.
                 if total_evals % overlay_refresh_every == 0:
                     level_info = per_level.get(lvl, {})
                     level_ref = level_info.get("ref_img")
@@ -528,10 +558,7 @@ def _run_and_stream():
                             out_size=(level_size, level_size),
                         )
                         fused_level = make_fusion(level_ref, warped_level)
-                        display_img = cv2.resize(
-                            fused_level, (ref_size, ref_size),
-                            interpolation=cv2.INTER_NEAREST,
-                        )
+                        display_img = pad_to_frame(fused_level, ref_size)
                         caption = (f"live overlay - L{lvl} @ {level_size}px "
                                    f"| eval {total_evals}")
                     else:
