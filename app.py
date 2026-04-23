@@ -38,17 +38,34 @@ from visualization import (  # noqa: E402
     make_fusion,
     warp_affine,
 )
+from ETNA.optimizers_pyramidal import ImagePyramid  # noqa: E402
 
 IMAGES_DIR = _THIS / "images"
-LEVEL_COLOURS = ["#e74c3c", "#f39c12", "#3498db", "#27ae60"]
-LEVEL_LABELS = ["L0 (full)", "L1 (1/2)", "L2 (1/4)", "L3 (1/8)"]
-# Plotly palette mirrored as BGR tuples for OpenCV annotations.
-LEVEL_COLOURS_BGR = {
-    0: (60, 76, 231),    # ~ #e74c3c
-    1: (18, 156, 243),   # ~ #f39c12
-    2: (219, 152, 52),   # ~ #3498db
-    3: (96, 174, 39),    # ~ #27ae60
-}
+# Palette with 8 distinct colours — enough to cover the full pyramid slider range.
+LEVEL_PALETTE = [
+    "#e74c3c", "#f39c12", "#3498db", "#27ae60",
+    "#9b59b6", "#1abc9c", "#e67e22", "#2ecc71",
+]
+
+
+def level_colour(idx: int) -> str:
+    return LEVEL_PALETTE[idx % len(LEVEL_PALETTE)]
+
+
+def level_label(idx: int) -> str:
+    suffix = "full" if idx == 0 else f"1/{2 ** idx}"
+    return f"L{idx} ({suffix})"
+
+
+def level_size_badge(idx: int) -> str:
+    return "1×" if idx == 0 else f"1/{2 ** idx}×"
+
+
+def level_bgr(idx: int) -> tuple[int, int, int]:
+    """Return the palette entry for ``idx`` as an OpenCV BGR tuple."""
+    hex_colour = level_colour(idx).lstrip("#")
+    r, g, b = int(hex_colour[0:2], 16), int(hex_colour[2:4], 16), int(hex_colour[4:6], 16)
+    return (b, g, r)
 
 # ---------------------------------------------------------------------------
 # Page setup
@@ -169,6 +186,10 @@ with st.sidebar:
     metric = st.selectbox("Similarity metric", ["mi", "mse", "cc"], index=0)
     optimizer = st.selectbox("Optimizer", ["powell", "oneplusone"], index=0)
     ref_size = st.select_slider("Reference size", [128, 256, 512], value=256)
+    num_levels = st.slider(
+        "Pyramid levels", min_value=1, max_value=8, value=4,
+        help="Coarse-to-fine resolution levels (1 = single-level, no pyramid).",
+    )
 
     run_clicked = st.button("Run ETNA", type="primary", use_container_width=True,
                             disabled=pair_name is None)
@@ -258,16 +279,16 @@ rate_slot = kpi_cols[4].empty()
 rmse_kpi_slot = kpi_cols[5].empty()
 
 
-def render_ladder(active_level: int) -> str:
+def render_ladder(active_level: int, n_levels: int) -> str:
     cells = []
-    for idx, label in enumerate(LEVEL_LABELS):
+    for idx in range(n_levels):
         is_active = (idx == active_level)
-        bg = LEVEL_COLOURS[idx] if is_active else "#2a2a2a"
+        bg = level_colour(idx) if is_active else "#2a2a2a"
         border = "#ffffff" if is_active else "#333"
-        size = {0: "1×", 1: "½×", 2: "¼×", 3: "⅛×"}[idx]
         cells.append(
             f'<div class="ladder-cell" style="background:{bg};border-color:{border};">'
-            f"{label} &nbsp; <span style='opacity:.8;font-size:0.78rem'>{size}</span></div>"
+            f"{level_label(idx)} &nbsp; <span style='opacity:.8;font-size:0.78rem'>"
+            f"{level_size_badge(idx)}</span></div>"
         )
     return "".join(cells)
 
@@ -292,7 +313,7 @@ def render_kpi(slot, label: str, value: str, color: str = "#fff") -> None:
 
 
 # Initial state for the live slots.
-ladder_slot.markdown(render_ladder(-1), unsafe_allow_html=True)
+ladder_slot.markdown(render_ladder(-1, num_levels), unsafe_allow_html=True)
 matrix_slot.markdown(render_matrix(np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)),
                      unsafe_allow_html=True)
 
@@ -334,8 +355,8 @@ render_kpi(rmse_kpi_slot, "RMSE (px)", "— / —")
 
 def _run_and_stream():
     # Per-level bookkeeping fed by the event stream.
-    series: dict[int, list[tuple[int, float]]] = {0: [], 1: [], 2: [], 3: []}
-    rmse_series: dict[int, list[tuple[int, float]]] = {0: [], 1: [], 2: [], 3: []}
+    series: dict[int, list[tuple[int, float]]] = {i: [] for i in range(num_levels)}
+    rmse_series: dict[int, list[tuple[int, float]]] = {i: [] for i in range(num_levels)}
     level_timings: dict[int, float] = {}
     level_start_time: dict[int, float] = {}
     active_level = -1
@@ -347,6 +368,39 @@ def _run_and_stream():
     initial_rmse: float | None = None
     best_rmse: float = float("inf")
 
+    # Per-level snapshot persisted in session state so the post-run clickable
+    # ladder can drill into any level even after Streamlit reruns.
+    per_level: dict[int, dict] = {}
+    for i in range(num_levels):
+        per_level[i] = {
+            "size": 0,
+            "series": [],
+            "rmse_series": [],
+            "wall_time": 0.0,
+            "final_transform": None,
+            "ref_img": None,
+            "moving_img": None,
+        }
+
+    # Pre-build the ref/moving pyramid so the detail panel has the downsampled
+    # images ready (the optimizer builds its own internally with the same
+    # ``ImagePyramid`` parameters).
+    try:
+        import torch as _torch
+        ref_pyr = ImagePyramid(_torch.from_numpy(fixed_img).byte(),
+                               levels=num_levels, scale_factor=0.5)
+        mov_pyr = ImagePyramid(_torch.from_numpy(moving_img).byte(),
+                               levels=num_levels, scale_factor=0.5)
+        for i in range(num_levels):
+            ref_np = ref_pyr.get_level(i).cpu().numpy().astype(np.uint8)
+            mov_np = mov_pyr.get_level(i).cpu().numpy().astype(np.uint8)
+            per_level[i]["ref_img"] = ref_np
+            per_level[i]["moving_img"] = mov_np
+            per_level[i]["size"] = int(ref_np.shape[-1])
+    except Exception:
+        # Non-fatal — the detail panel simply won't show previews.
+        pass
+
     event_q: queue.Queue = queue.Queue()
     thread, slot = run_etna_async(
         fixed_img, moving_img,
@@ -354,6 +408,7 @@ def _run_and_stream():
         metric=metric, optimizer=optimizer, ref_size=ref_size,
         event_queue=event_q,
         gt_mat_path=str(gt_path) if gt_path is not None else None,
+        num_pyramid_levels=num_levels,
     )
 
     status_msg = st.empty()
@@ -401,20 +456,32 @@ def _run_and_stream():
 
         elif isinstance(evt, LevelEvent):
             if evt.phase == "start":
-                # close previous level timing, open new
+                # Close previous level timing and snapshot its final transform.
                 if active_level >= 0 and active_level in level_start_time:
-                    level_timings[active_level] = now - level_start_time[active_level]
-                active_level = evt.level
+                    elapsed = now - level_start_time[active_level]
+                    level_timings[active_level] = elapsed
+                    if active_level in per_level:
+                        per_level[active_level]["wall_time"] = elapsed
+                        per_level[active_level]["final_transform"] = np.asarray(
+                            last_transform, dtype=np.float32
+                        ).copy()
+                active_level = max(0, min(num_levels - 1, evt.level))
                 level_start_time[active_level] = now
-                ladder_slot.markdown(render_ladder(active_level), unsafe_allow_html=True)
+                if active_level in per_level and evt.level_size:
+                    per_level[active_level]["size"] = int(evt.level_size)
+                ladder_slot.markdown(
+                    render_ladder(active_level, num_levels), unsafe_allow_html=True
+                )
                 render_kpi(level_slot, "Level", f"L{evt.level} @ {evt.level_size}px")
 
         elif isinstance(evt, MetricEvent):
             total_evals += 1
-            lvl = max(0, min(3, evt.level))
+            lvl = max(0, min(num_levels - 1, evt.level))
             series[lvl].append((total_evals, evt.value))
+            per_level[lvl]["series"].append((total_evals, evt.value))
             if evt.rmse_px is not None and not (evt.rmse_px != evt.rmse_px):  # NaN check
                 rmse_series[lvl].append((total_evals, float(evt.rmse_px)))
+                per_level[lvl]["rmse_series"].append((total_evals, float(evt.rmse_px)))
                 if evt.rmse_px < best_rmse:
                     best_rmse = float(evt.rmse_px)
             if evt.transform is not None:
@@ -431,7 +498,7 @@ def _run_and_stream():
                     overlay_slot.image(
                         annotate(make_fusion(fixed_img, warped_live),
                                  f"live overlay - L{lvl} | eval {total_evals}",
-                                 LEVEL_COLOURS_BGR[lvl]),
+                                 level_bgr(lvl)),
                         channels="BGR", use_container_width=True,
                     )
 
@@ -444,8 +511,8 @@ def _run_and_stream():
                     ys = [p[1] for p in pts]
                     fig.add_trace(go.Scatter(
                         x=xs, y=ys, mode="lines+markers",
-                        name=LEVEL_LABELS[idx],
-                        line=dict(color=LEVEL_COLOURS[idx], width=2),
+                        name=level_label(idx),
+                        line=dict(color=level_colour(idx), width=2),
                         marker=dict(size=4),
                     ))
                 fig.update_layout(
@@ -467,8 +534,8 @@ def _run_and_stream():
                         ys = [p[1] for p in pts]
                         rmse_fig.add_trace(go.Scatter(
                             x=xs, y=ys, mode="lines+markers",
-                            name=LEVEL_LABELS[idx],
-                            line=dict(color=LEVEL_COLOURS[idx], width=2),
+                            name=level_label(idx),
+                            line=dict(color=level_colour(idx), width=2),
                             marker=dict(size=4),
                         ))
                     if initial_rmse is not None:
@@ -509,6 +576,24 @@ def _run_and_stream():
                                delta_colour)
 
     thread.join(timeout=2.0)
+
+    # Close out the last active level so the detail panel has a transform
+    # snapshot and wall-time for every level that actually ran.
+    if active_level >= 0 and active_level in level_start_time:
+        elapsed = time.time() - level_start_time[active_level]
+        level_timings[active_level] = elapsed
+        if active_level in per_level:
+            per_level[active_level]["wall_time"] = elapsed
+            per_level[active_level]["final_transform"] = np.asarray(
+                last_transform, dtype=np.float32
+            ).copy()
+
+    # Persist per-level snapshot so the clickable ladder (rendered on the next
+    # rerun after a button press) can pull from session_state.
+    st.session_state.per_level = per_level
+    st.session_state.last_run_num_levels = num_levels
+    if "selected_layer" not in st.session_state:
+        st.session_state.selected_layer = 0
 
     if "error" in slot:
         st.error(f"Run failed: {slot['error']}")
@@ -645,3 +730,83 @@ if run_clicked:
                                     key="per-lm-hist")
 else:
     st.caption("Pick a pair in the sidebar and hit **Run ETNA** to start the live demo.")
+
+
+# ---------------------------------------------------------------------------
+# Clickable pyramid ladder + per-layer detail panel (post-run)
+# ---------------------------------------------------------------------------
+
+def _render_layer_detail(level: int) -> None:
+    info = st.session_state.per_level.get(level)
+    if not info:
+        st.info(f"No data captured for L{level}.")
+        return
+    size = info.get("size") or 0
+    wall = info.get("wall_time", 0.0)
+    n_evals = len(info.get("series", []))
+    st.markdown(f"### Layer L{level} — {size}×{size} px · "
+                f"{wall:.2f} s · {n_evals} evals")
+
+    c1, c2 = st.columns(2)
+    if info.get("ref_img") is not None:
+        c1.image(info["ref_img"], caption=f"Ref @ L{level}",
+                 use_container_width=True, channels="GRAY")
+    else:
+        c1.info("Ref preview unavailable.")
+    if info.get("moving_img") is not None:
+        c2.image(info["moving_img"], caption=f"Moving @ L{level}",
+                 use_container_width=True, channels="GRAY")
+    else:
+        c2.info("Moving preview unavailable.")
+
+    colour = level_colour(level)
+
+    mfig = go.Figure()
+    if info["series"]:
+        xs, ys = zip(*info["series"])
+        mfig.add_trace(go.Scatter(
+            x=list(xs), y=list(ys), mode="lines+markers",
+            line=dict(color=colour, width=2), marker=dict(size=4),
+        ))
+    mfig.update_layout(
+        template="plotly_dark", height=240,
+        margin=dict(l=10, r=10, t=20, b=30),
+        xaxis_title="metric eval #", yaxis_title="similarity value",
+        showlegend=False,
+    )
+    st.plotly_chart(mfig, use_container_width=True, key=f"detail-metric-{level}")
+
+    if info["rmse_series"]:
+        rfig = go.Figure()
+        xs, ys = zip(*info["rmse_series"])
+        rfig.add_trace(go.Scatter(
+            x=list(xs), y=list(ys), mode="lines+markers",
+            line=dict(color=colour, width=2), marker=dict(size=4),
+        ))
+        rfig.update_layout(
+            template="plotly_dark", height=240,
+            margin=dict(l=10, r=10, t=20, b=30),
+            xaxis_title="metric eval #", yaxis_title="RMSE (px)",
+            showlegend=False,
+        )
+        st.plotly_chart(rfig, use_container_width=True, key=f"detail-rmse-{level}")
+    else:
+        st.caption("No ground-truth RMSE available for this layer.")
+
+    st.markdown("**Transform at end of layer (2×3)**")
+    st.markdown(render_matrix(info.get("final_transform")), unsafe_allow_html=True)
+
+
+if st.session_state.get("per_level"):
+    st.markdown("---")
+    st.subheader("Pyramid ladder — click a layer to inspect")
+    n_done = int(st.session_state.get("last_run_num_levels", num_levels))
+    cols = st.columns(n_done)
+    for i, col in enumerate(cols):
+        is_selected = (i == st.session_state.get("selected_layer", 0))
+        label = f"{'▶ ' if is_selected else ''}{level_label(i)}"
+        if col.button(label, key=f"layer-btn-{i}", use_container_width=True,
+                      type="primary" if is_selected else "secondary"):
+            st.session_state.selected_layer = i
+            st.rerun()
+    _render_layer_detail(int(st.session_state.get("selected_layer", 0)))

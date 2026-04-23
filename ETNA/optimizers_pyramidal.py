@@ -244,12 +244,12 @@ class EtnaMultiOnePlusOne(EtnaMultiSwOptimizers):
             results.append(H_final)
         return results[0] if len(results) == 1 else results
 
-    def compute(self, ref_tensor: torch.Tensor, flt_tensor: torch.Tensor, metric_component, image_dimension, use_pyramid=True):
+    def compute(self, ref_tensor: torch.Tensor, flt_tensor: torch.Tensor, metric_component, image_dimension, use_pyramid=True, num_levels: int = 4):
         device = metric_component.device
         Ref_uint8 = self._normalize_to_uint8(ref_tensor, device)
         Flt_uint8 = self._normalize_to_uint8(flt_tensor, device)
 
-        if not use_pyramid:
+        if not use_pyramid or num_levels <= 1:
             logger.info("[Pyramid] Single-level fallback")
             start_single = time.time()
             _, H = self.register_images(Ref_uint8, Flt_uint8, metric_component)
@@ -257,7 +257,6 @@ class EtnaMultiOnePlusOne(EtnaMultiSwOptimizers):
             return H
 
         pyramid_start = time.time()
-        num_levels = 4
         flt_pyramid = ImagePyramid(Flt_uint8, num_levels, 0.5, device)
         ref_pyramid = ImagePyramid(Ref_uint8, num_levels, 0.5, device)
         logger.info(f"[Pyramid] Construction time: {time.time() - pyramid_start:.4f}s")
@@ -276,7 +275,8 @@ class EtnaMultiOnePlusOne(EtnaMultiSwOptimizers):
                 H_init = self.scale_transformation_matrix(prev_H, 0.5, direction='up')
 
             _, H_level = self.register_images_adaptive(
-                ref_level, flt_level, metric_component, H_init, level
+                ref_level, flt_level, metric_component, H_init, level,
+                max_level=num_levels,
             )
             level_transforms.append(H_level.cpu().numpy())
 
@@ -284,7 +284,7 @@ class EtnaMultiOnePlusOne(EtnaMultiSwOptimizers):
 
         return level_transforms[-1]
 
-    def register_images_adaptive(self, Ref_uint8, Flt_uint8, metric_component, H_init=None, level=0):
+    def register_images_adaptive(self, Ref_uint8, Flt_uint8, metric_component, H_init=None, level=0, max_level: int = 4):
         parent = torch.empty((2, 3), device=metric_component.device)
         metric_component.estimate_initial(Ref_uint8, Flt_uint8, parent)
 
@@ -296,8 +296,8 @@ class EtnaMultiOnePlusOne(EtnaMultiSwOptimizers):
         Ref_uint8_ravel = Ref_uint8.ravel().double()
         eref = metric_component.precompute_metric(Ref_uint8_ravel)
 
-        max_iter = AdaptiveParameters.get_iterations(level, 4, 'oneplusone')
-        epsilon = AdaptiveParameters.get_tolerance(level, 4, 'oneplusone')
+        max_iter = AdaptiveParameters.get_iterations(level, max_level, 'oneplusone')
+        epsilon = AdaptiveParameters.get_tolerance(level, max_level, 'oneplusone')
 
         optimal_params = self.OnePlusOne_adaptive(
             Ref_uint8, Flt_uint8, metric_component, eref, parent,
@@ -393,12 +393,12 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
             results.append(H_final)
         return results[0] if len(results) == 1 else results
 
-    def compute(self, ref_tensor: torch.Tensor, flt_tensor: torch.Tensor, metric_component, image_dimension, use_pyramid=True):
+    def compute(self, ref_tensor: torch.Tensor, flt_tensor: torch.Tensor, metric_component, image_dimension, use_pyramid=True, num_levels: int = 4):
         device = metric_component.device
         Ref_uint8 = self._normalize_to_uint8(ref_tensor, device)
         Flt_uint8 = self._normalize_to_uint8(flt_tensor, device)
 
-        if not use_pyramid:
+        if not use_pyramid or num_levels <= 1:
             logger.info("[Pyramid] Single-level fallback")
             start_single = time.time()
             _, H = self.register_images(Ref_uint8, Flt_uint8, metric_component)
@@ -406,7 +406,6 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
             return H
 
         pyramid_start = time.time()
-        num_levels = 4
         flt_pyramid = ImagePyramid(Flt_uint8, num_levels, 0.5, device)
         ref_pyramid = ImagePyramid(Ref_uint8, num_levels, 0.5, device)
         logger.info(f"[Pyramid] Construction time: {time.time() - pyramid_start:.4f}s")
@@ -432,7 +431,8 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
                 H_init = self.scale_transformation_matrix(prev_H, 0.5, direction='up')
 
             _, H_level = self.register_images_adaptive(
-                ref_level, flt_level, metric_component, H_init, level
+                ref_level, flt_level, metric_component, H_init, level,
+                max_level=num_levels,
             )
             level_transforms[level] = H_level.cpu().numpy()
             prev_level = level
@@ -441,7 +441,7 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
 
         return level_transforms[0]
 
-    def register_images_adaptive(self, Ref_uint8, Flt_uint8, metric_component, H_init=None, level=0, max_iterations_override=None):
+    def register_images_adaptive(self, Ref_uint8, Flt_uint8, metric_component, H_init=None, level=0, max_iterations_override=None, max_level: int = 4):
         params = torch.empty((2, 3), device=metric_component.device)
         params_cpu = params.cpu()
 
@@ -458,9 +458,9 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
             params_cpu[1][0] = 1.0
 
         base_ranges = [
-            AdaptiveParameters.get_search_range(level, 4, 0),
-            AdaptiveParameters.get_search_range(level, 4, 1),
-            AdaptiveParameters.get_search_range(level, 4, 2),
+            AdaptiveParameters.get_search_range(level, max_level, 0),
+            AdaptiveParameters.get_search_range(level, max_level, 1),
+            AdaptiveParameters.get_search_range(level, max_level, 2),
         ]
 
         rng = torch.tensor(base_ranges)
@@ -472,6 +472,7 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         optimal_params = self.optimize_powell_adaptive(
             rng, pa, Ref_uint8, Flt_uint8, metric_component, eref, level,
             max_iterations_override=max_iterations_override,
+            max_level=max_level,
         )
 
         params_trans = metric_component.to_matrix_blocked(optimal_params)
@@ -480,11 +481,11 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         return flt_transform, params_trans
 
     def optimize_powell_adaptive(self, rng, par_lin, ref_sup_2D, flt_sup,
-                                 metric_component, eref, level, max_iterations_override=None):
+                                 metric_component, eref, level, max_iterations_override=None, max_level: int = 4):
         """Powell iterations with per-level tolerance and randomized parameter order."""
         converged = False
-        eps = AdaptiveParameters.get_tolerance(level, 4, 'powell')
-        max_iterations = max_iterations_override or AdaptiveParameters.get_iterations(level, 4, 'powell')
+        eps = AdaptiveParameters.get_tolerance(level, max_level, 'powell')
+        max_iterations = max_iterations_override or AdaptiveParameters.get_iterations(level, max_level, 'powell')
 
         last_mut = 100000.0
         it = 0
@@ -510,6 +511,7 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
                 param_opt, cur_mi = self.optimize_goldsearch_adaptive(
                     cur_par, cur_rng, ref_sup_2D, flt_sup,
                     par_lin, param_idx, metric_component, eref, level,
+                    max_level=max_level,
                 )
 
                 par_lin[param_idx] = cur_par
@@ -527,9 +529,9 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         return best_params
 
     def optimize_goldsearch_adaptive(self, par, rng, ref_sup_2D, flt_sup,
-                                     linear_par, i, metric_component, eref, level):
+                                     linear_par, i, metric_component, eref, level, max_level: int = 4):
         """Adaptive golden-section search with per-level tuning."""
-        base_threshold = AdaptiveParameters.get_gss_threshold(level, 4)
+        base_threshold = AdaptiveParameters.get_gss_threshold(level, max_level)
         threshold = base_threshold * 5.0
 
         if level == 0:
