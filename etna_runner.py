@@ -180,18 +180,16 @@ class InstrumentedMetric(EtnaMultiMetric):
         return value
 
     def _infer_level(self, level_size: int) -> int:
-        """Infer pyramid level index (0 = finest) from the current ref size."""
-        full = max(self.ref_size, level_size, 1)
+        """Infer pyramid level index (0 = finest) from the current ref size.
+
+        Each pyramid level halves the resolution, so level = round(log2(full / size)).
+        """
         if level_size <= 0:
             return -1
+        full = max(self.ref_size, level_size, 1)
+        import math
         ratio = full / float(level_size)
-        if ratio < 1.5:
-            return 0
-        if ratio < 3:
-            return 1
-        if ratio < 6:
-            return 2
-        return 3
+        return max(0, int(round(math.log2(ratio))))
 
     def _emit(self, event) -> None:
         try:
@@ -377,6 +375,7 @@ def run_etna(
     ref_size: int = 256,
     event_queue: queue.Queue | None = None,
     gt_mat_path: str | Path | None = None,
+    num_pyramid_levels: int = 4,
 ) -> RunResult:
     """Run ETNA end-to-end on a pair of numpy grayscale uint8 images.
 
@@ -444,7 +443,11 @@ def run_etna(
     opt = opt_cls()
 
     try:
-        H = opt.compute(ref_t, flt_t, metric_component, ref_size, use_pyramid=True)
+        H = opt.compute(
+            ref_t, flt_t, metric_component, ref_size,
+            use_pyramid=num_pyramid_levels > 1,
+            num_levels=num_pyramid_levels,
+        )
     except Exception as exc:
         if event_queue is not None:
             event_queue.put(StatusEvent(
@@ -515,7 +518,8 @@ def run_etna(
 # ---------------------------------------------------------------------------
 
 def run_etna_async(fixed_img, moving_img, *, device, metric, optimizer, ref_size,
-                   event_queue, gt_mat_path: str | Path | None = None
+                   event_queue, gt_mat_path: str | Path | None = None,
+                   num_pyramid_levels: int = 4,
                    ) -> tuple[threading.Thread, dict]:
     """Launch ``run_etna`` on a background thread.
 
@@ -531,6 +535,7 @@ def run_etna_async(fixed_img, moving_img, *, device, metric, optimizer, ref_size
                 device=device, metric=metric, optimizer=optimizer,
                 ref_size=ref_size, event_queue=event_queue,
                 gt_mat_path=gt_mat_path,
+                num_pyramid_levels=num_pyramid_levels,
             )
         except Exception as exc:
             logger.exception("ETNA worker crashed")
