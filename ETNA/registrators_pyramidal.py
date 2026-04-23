@@ -218,19 +218,24 @@ class EtnaMultiMetric(object):
         return moments
 
     def to_matrix_blocked(self, vector_params):
+        """Build a 2x3 rigid affine ``[[cosθ, -sinθ, tx], [sinθ, cosθ, ty]]``.
+
+        ``vector_params`` is the 3-vector ``[tx, ty, θ]`` (θ in radians). The
+        previous implementation parametrised the rotation with ``cos(θ)``
+        alone and derived ``sin`` as ``+sqrt(1 - cos²)``, which silently
+        collapsed the rotation to a single sign and forbade the optimizer
+        from ever recovering the opposite rotation direction.
+        """
         mat_params = torch.empty((2, 3))
         mat_params[0][2] = vector_params[0]
         mat_params[1][2] = vector_params[1]
-        if vector_params[2] > 1 or vector_params[2] < -1:
-            mat_params[0][0] = 1
-            mat_params[1][1] = 1
-            mat_params[0][1] = 0
-            mat_params[1][0] = 0
-        else:
-            mat_params[0][0] = vector_params[2]
-            mat_params[1][1] = vector_params[2]
-            mat_params[0][1] = torch.sqrt(1 - (vector_params[2] ** 2))
-            mat_params[1][0] = -mat_params[0][1]
+        theta = vector_params[2]
+        cos_t = torch.cos(theta) if torch.is_tensor(theta) else torch.cos(torch.as_tensor(theta))
+        sin_t = torch.sin(theta) if torch.is_tensor(theta) else torch.sin(torch.as_tensor(theta))
+        mat_params[0][0] = cos_t
+        mat_params[0][1] = -sin_t
+        mat_params[1][0] = sin_t
+        mat_params[1][1] = cos_t
         return mat_params
 
     def estimate_initial(self, Ref_uint8, Flt_uint8, params):

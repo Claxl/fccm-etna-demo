@@ -323,11 +323,21 @@ class EtnaMultiOnePlusOne(EtnaMultiSwOptimizers):
         spaceDimension = 3
         A = torch.eye(spaceDimension, device=metric_component.device) * initial_radius
 
+        # Recover θ from the 2x3 rigid matrix ([[cosθ, -sinθ, tx], [sinθ, cosθ, ty]])
+        # so the optimizer walks in angle space rather than in cos(θ).
+        theta_seed = torch.atan2(parent_cpu[1][0], parent_cpu[0][0])
         parentPosition = torch.tensor(
-            [parent_cpu[0][2], parent_cpu[1][2], parent_cpu[0][0]],
+            [parent_cpu[0][2], parent_cpu[1][2], theta_seed],
             device=metric_component.device,
         )
 
+        # Keep the seed matrix passed into compute_metric consistent with
+        # parentPosition (estimate_initial may have filled parent with cos/sin
+        # that don't match [[cosθ, -sinθ], [sinθ, cosθ]] exactly after the
+        # atan2 round-trip — re-synthesize it through to_matrix_blocked).
+        parent = metric_component.to_matrix_blocked(parentPosition.cpu()).to(
+            metric_component.device
+        )
         pvalue = metric_component.compute_metric(Ref_uint8_2D, Flt_uint8, parent, eref)
 
         patience = max(30, max_iterations // 3)
@@ -442,20 +452,17 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         return level_transforms[0]
 
     def register_images_adaptive(self, Ref_uint8, Flt_uint8, metric_component, H_init=None, level=0, max_iterations_override=None, max_level: int = 4):
-        params = torch.empty((2, 3), device=metric_component.device)
-        params_cpu = params.cpu()
-
-        # Seed from previous level, or start from identity
+        # Seed the 3-parameter search vector [tx, ty, θ] from the prior (H_init
+        # is a 2x3 rigid matrix [[cosθ, -sinθ, tx], [sinθ, cosθ, ty]], so the
+        # rotation angle is recovered via atan2 instead of reading only cos).
         if H_init is not None:
-            params_cpu[0][2] = torch.tensor(H_init[0][2])
-            params_cpu[1][2] = torch.tensor(H_init[1][2])
-            params_cpu[0][0] = torch.tensor(H_init[0][0])
-            params_cpu[1][0] = torch.tensor(H_init[1][0])
+            tx_seed = float(H_init[0][2])
+            ty_seed = float(H_init[1][2])
+            theta_seed = float(np.arctan2(float(H_init[1][0]), float(H_init[0][0])))
         else:
-            params_cpu[0][2] = 0.0
-            params_cpu[1][2] = 0.0
-            params_cpu[0][0] = 1.0
-            params_cpu[1][0] = 1.0
+            tx_seed = 0.0
+            ty_seed = 0.0
+            theta_seed = 0.0
 
         base_ranges = [
             AdaptiveParameters.get_search_range(level, max_level, 0),
@@ -464,7 +471,7 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         ]
 
         rng = torch.tensor(base_ranges)
-        pa = torch.tensor([params_cpu[0][2], params_cpu[1][2], params_cpu[0][0]])
+        pa = torch.tensor([tx_seed, ty_seed, theta_seed])
 
         Ref_uint8_ravel = Ref_uint8.ravel().double()
         eref = metric_component.precompute_metric(Ref_uint8_ravel)

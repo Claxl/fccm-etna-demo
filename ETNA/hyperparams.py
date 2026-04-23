@@ -42,7 +42,9 @@ class FaberHyperParams:
     powell_optimize_eps = 0.000005
     powell_rng_1 = 40.0
     powell_rng_2 = 40.0
-    powell_rng_3 = 1.0
+    # Angle (radians). Previously 1.0 when the 3rd DOF was cos(θ); in angle
+    # space ~π/2 gives the GSS a ±45–90° window depending on the level.
+    powell_rng_3 = 1.5707963267948966
     powell_MaximumIteration = 100
 
 
