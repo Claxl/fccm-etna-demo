@@ -1,0 +1,35 @@
+# ---------------------------------------------------------------------------
+# DEMO-FCCM — self-contained requirements file.
+#
+# Install with:
+#     pip install -r requirements-demo.txt
+#
+# Tested with Python 3.10 / 3.11.
+# ---------------------------------------------------------------------------
+
+# --- Core scientific stack ---
+numpy>=1.23
+scipy>=1.10                # scipy.io.loadmat for .mat GT + scipy.signal (Parzen MI)
+
+# --- Imaging ---
+opencv-python>=4.8         # image I/O + warpAffine + checkerboard/diff
+
+# --- Deep-learning stack (used by ETNA's pyramidal MI path) ---
+# Install a build of torch/torchvision compatible with your CUDA runtime if
+# you want GPU acceleration: https://pytorch.org/get-started/locally/.
+# For the FCCM demo on CPU / Kria the default wheels are fine.
+torch>=2.0
+torchvision>=0.15
+kornia>=0.7                # affine warp kernels used inside EtnaMultiMetric
+
+# --- Dashboard ---
+streamlit>=1.30
+plotly>=5.18
+
+# --- FPGA runtime (OPTIONAL) ----------------------------------------------
+# Uncomment only on a Xilinx Kria KV260 / KR260 with the wax_mi_accel overlay
+# available. Without it the demo silently falls back to the software MI
+# implementation (the sidebar badge will read
+# "FPGA requested -> software fallback").
+#
+# pynq>=3.0
