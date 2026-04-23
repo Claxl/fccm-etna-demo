@@ -218,23 +218,30 @@ class EtnaMultiMetric(object):
         return moments
 
     def to_matrix_blocked(self, vector_params):
-        """Build a 2x3 rigid affine ``[[cosθ, -sinθ, tx], [sinθ, cosθ, ty]]``.
+        """Build a 2x3 rigid affine ``[[cosθ, +sinθ, tx], [-sinθ, cosθ, ty]]``.
 
-        ``vector_params`` is the 3-vector ``[tx, ty, θ]`` (θ in radians). The
-        previous implementation parametrised the rotation with ``cos(θ)``
-        alone and derived ``sin`` as ``+sqrt(1 - cos²)``, which silently
-        collapsed the rotation to a single sign and forbade the optimizer
-        from ever recovering the opposite rotation direction.
+        ``vector_params`` is the 3-vector ``[tx, ty, θ]`` (θ in radians).
+
+        Signs preserve the ETNA/kornia convention: ``kornia.warp_affine``
+        uses ``M`` as an inverse (dst→src) mapping, so a visual rotation of
+        the floating image by ``+θ`` requires ``M = R(-θ)``. The previous
+        implementation parametrised only ``cos(θ)`` and derived
+        ``sin`` as ``+sqrt(1 − cos²)``, which pinned the sign of ``sin`` to
+        non-negative and forbade the optimizer from ever recovering
+        rotations of the opposite sign. Parametrising ``θ`` directly keeps
+        the same sign convention but lifts that restriction.
         """
         mat_params = torch.empty((2, 3))
         mat_params[0][2] = vector_params[0]
         mat_params[1][2] = vector_params[1]
         theta = vector_params[2]
-        cos_t = torch.cos(theta) if torch.is_tensor(theta) else torch.cos(torch.as_tensor(theta))
-        sin_t = torch.sin(theta) if torch.is_tensor(theta) else torch.sin(torch.as_tensor(theta))
+        if not torch.is_tensor(theta):
+            theta = torch.as_tensor(theta)
+        cos_t = torch.cos(theta)
+        sin_t = torch.sin(theta)
         mat_params[0][0] = cos_t
-        mat_params[0][1] = -sin_t
-        mat_params[1][0] = sin_t
+        mat_params[0][1] = sin_t
+        mat_params[1][0] = -sin_t
         mat_params[1][1] = cos_t
         return mat_params
 
@@ -263,9 +270,14 @@ class EtnaMultiMetric(object):
 
         roundness = (flt_mom[2] / flt_mom[0]) / (flt_mom[4] / flt_mom[0])
         if torch.abs(roundness - 1.0) >= 0.3:
+            # Match the ETNA inverse-mapping convention used by
+            # ``to_matrix_blocked`` (``M = [[cosθ, sinθ], [-sinθ, cosθ]]``)
+            # so that recovering θ via ``atan2(M[0][1], M[0][0])`` yields
+            # the same value whether the seed comes from here or from a
+            # previous pyramid level's transform.
             params[0][0] = torch.cos(delta_rho)
-            params[0][1] = -torch.sin(delta_rho)
-            params[1][0] = torch.sin(delta_rho)
+            params[0][1] = torch.sin(delta_rho)
+            params[1][0] = -torch.sin(delta_rho)
             params[1][1] = torch.cos(delta_rho)
         else:
             params[0][0] = 1.0

@@ -254,7 +254,7 @@ class EtnaMultiOnePlusOne(EtnaMultiSwOptimizers):
             start_single = time.time()
             _, H = self.register_images(Ref_uint8, Flt_uint8, metric_component)
             logger.info(f"[Pyramid] Single-level time: {time.time() - start_single:.4f}s")
-            return H
+            return H.detach().cpu().numpy() if torch.is_tensor(H) else H
 
         pyramid_start = time.time()
         flt_pyramid = ImagePyramid(Flt_uint8, num_levels, 0.5, device)
@@ -323,18 +323,19 @@ class EtnaMultiOnePlusOne(EtnaMultiSwOptimizers):
         spaceDimension = 3
         A = torch.eye(spaceDimension, device=metric_component.device) * initial_radius
 
-        # Recover θ from the 2x3 rigid matrix ([[cosθ, -sinθ, tx], [sinθ, cosθ, ty]])
-        # so the optimizer walks in angle space rather than in cos(θ).
-        theta_seed = torch.atan2(parent_cpu[1][0], parent_cpu[0][0])
+        # Recover θ from the 2x3 rigid matrix (``[[cosθ, sinθ, tx],
+        # [-sinθ, cosθ, ty]]`` — ETNA/kornia inverse-mapping convention) so
+        # the optimizer walks in signed angle space rather than in cos(θ).
+        theta_seed = torch.atan2(parent_cpu[0][1], parent_cpu[0][0])
         parentPosition = torch.tensor(
             [parent_cpu[0][2], parent_cpu[1][2], theta_seed],
             device=metric_component.device,
         )
 
-        # Keep the seed matrix passed into compute_metric consistent with
-        # parentPosition (estimate_initial may have filled parent with cos/sin
-        # that don't match [[cosθ, -sinθ], [sinθ, cosθ]] exactly after the
-        # atan2 round-trip — re-synthesize it through to_matrix_blocked).
+        # Keep the seed matrix fed to compute_metric consistent with
+        # parentPosition (estimate_initial may have filled parent with
+        # cos/sin that don't exactly match the ``to_matrix_blocked`` layout
+        # after the atan2 round-trip — re-synthesize it).
         parent = metric_component.to_matrix_blocked(parentPosition.cpu()).to(
             metric_component.device
         )
@@ -413,7 +414,7 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
             start_single = time.time()
             _, H = self.register_images(Ref_uint8, Flt_uint8, metric_component)
             logger.info(f"[Pyramid] Single-level time: {time.time() - start_single:.4f}s")
-            return H
+            return H.detach().cpu().numpy() if torch.is_tensor(H) else H
 
         pyramid_start = time.time()
         flt_pyramid = ImagePyramid(Flt_uint8, num_levels, 0.5, device)
@@ -452,13 +453,16 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         return level_transforms[0]
 
     def register_images_adaptive(self, Ref_uint8, Flt_uint8, metric_component, H_init=None, level=0, max_iterations_override=None, max_level: int = 4):
-        # Seed the 3-parameter search vector [tx, ty, θ] from the prior (H_init
-        # is a 2x3 rigid matrix [[cosθ, -sinθ, tx], [sinθ, cosθ, ty]], so the
-        # rotation angle is recovered via atan2 instead of reading only cos).
+        # Seed the 3-parameter search vector [tx, ty, θ] from the prior.
+        # With the ETNA convention ``M = [[cosθ, sinθ], [-sinθ, cosθ]]``,
+        # the rotation angle is recovered via atan2(M[0][1], M[0][0]).
+        # Previously the code read only M[0][0] as the 3rd parameter, which
+        # dropped the sign of sin and collapsed rotation to a single
+        # direction; atan2 restores the signed angle.
         if H_init is not None:
             tx_seed = float(H_init[0][2])
             ty_seed = float(H_init[1][2])
-            theta_seed = float(np.arctan2(float(H_init[1][0]), float(H_init[0][0])))
+            theta_seed = float(np.arctan2(float(H_init[0][1]), float(H_init[0][0])))
         else:
             tx_seed = 0.0
             ty_seed = 0.0
