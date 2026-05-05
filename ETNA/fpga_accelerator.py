@@ -81,8 +81,10 @@ class FaberFPGAAccelerator:
         self.mi_hls_buffer = None
 
         # Cache state: used to avoid redundant AXI-Lite register writes.
-        self._last_ref_id = None
-        self._last_flt_id = None
+        # Signature is (data_ptr, shape, dtype) — more reliable than id() which
+        # Python can reuse after a previous tensor is garbage-collected.
+        self._last_ref_sig = None
+        self._last_flt_sig = None
         self._registers_configured = False
 
         if not PYNQ_AVAILABLE:
@@ -103,8 +105,26 @@ class FaberFPGAAccelerator:
             except RuntimeError:
                 asyncio.set_event_loop(asyncio.new_event_loop())
 
+            # ETXTBSY (errno 26 "Text file busy") happens when another process
+            # is still loading the bitstream. Retry a few times with backoff
+            # before giving up so a previous Streamlit instance has time to
+            # release the FPGA.
             logger.info(f"Loading FPGA Overlay: {overlay_path}...")
-            self.overlay = Overlay(overlay_path)
+            _attempts = 0
+            while True:
+                try:
+                    self.overlay = Overlay(overlay_path)
+                    break
+                except OSError as oe:
+                    if oe.errno != 26 or _attempts >= 3:
+                        raise
+                    _attempts += 1
+                    backoff = 0.5 * (2 ** _attempts)
+                    logger.warning(
+                        "Overlay load got ETXTBSY (Text file busy), retry "
+                        "%d in %.1fs...", _attempts, backoff,
+                    )
+                    time.sleep(backoff)
 
             # Resolve the accelerator IP block by known name or by substring.
             if hasattr(self.overlay, 'wax_mi_accel_0'):
@@ -151,6 +171,20 @@ class FaberFPGAAccelerator:
             return f"FPGA disabled: {self.init_error}"
         return "FPGA disabled"
 
+    @staticmethod
+    def _tensor_signature(t):
+        """Stable identity signature for cache invalidation.
+
+        Returns ``(memory_pointer, shape, dtype)`` for torch tensors and
+        numpy arrays. Falls back to ``id(t)`` for anything else (this only
+        happens if the optimizer passes something exotic).
+        """
+        if isinstance(t, torch.Tensor):
+            return (t.data_ptr(), tuple(t.shape), str(t.dtype))
+        if isinstance(t, np.ndarray):
+            return (t.ctypes.data, tuple(t.shape), str(t.dtype))
+        return (id(t),)
+
     def _ensure_buffers(self, rows: int, cols: int):
         """Lazily (re)allocate the input image buffers if the shape changed."""
         if (rows, cols) != self.current_shape:
@@ -165,8 +199,8 @@ class FaberFPGAAccelerator:
             self.current_shape = (rows, cols)
 
             # Invalidate cached register state
-            self._last_ref_id = None
-            self._last_flt_id = None
+            self._last_ref_sig = None
+            self._last_flt_sig = None
             self._registers_configured = False
 
     def compute_mi(self, ref_tensor, flt_tensor, transform_matrix_2x3) -> float:
@@ -187,16 +221,19 @@ class FaberFPGAAccelerator:
         rows, cols = ref_np.shape
         self._ensure_buffers(rows, cols)
 
-        # 2) Copy image data only if the input tensors changed identity.
-        curr_ref_id = id(ref_tensor)
-        curr_flt_id = id(flt_tensor)
+        # 2) Copy image data only if the underlying memory changed.
+        # Using id() is unreliable: Python may reuse an id() after the prior
+        # tensor is garbage-collected, leading to a stale buffer. Use the
+        # data pointer + shape + dtype as a more robust signature.
+        curr_ref_sig = self._tensor_signature(ref_tensor)
+        curr_flt_sig = self._tensor_signature(flt_tensor)
         need_addr_update = False
 
-        if curr_ref_id != self._last_ref_id or curr_flt_id != self._last_flt_id:
+        if curr_ref_sig != self._last_ref_sig or curr_flt_sig != self._last_flt_sig:
             self.input_flt_buffer[:] = flt_np
             self.input_ref_buffer[:] = ref_np
-            self._last_ref_id = curr_ref_id
-            self._last_flt_id = curr_flt_id
+            self._last_ref_sig = curr_ref_sig
+            self._last_flt_sig = curr_flt_sig
             self._registers_configured = False
             need_addr_update = True
 

@@ -457,17 +457,22 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
             ty = 0.0
             theta = 0.0
 
-        pa = torch.tensor([tx, ty, theta], dtype=torch.float32)
+        # float64 throughout: compute_metric returns float64 tensors (the MI
+        # path uses .double() internally), and mixing dtype caused subtle
+        # downcasts in the comparisons inside golden-section search.
+        pa = torch.tensor([tx, ty, theta], dtype=torch.float64)
 
-        # Cap rotation search range at 0.05 rad (~2.86°). The translation
-        # ranges from FaberHyperParams (40 px) are fine, but using the same
-        # numeric range for rotation makes the optimizer diverge.
+        # Adaptive rotation cap: tight at the finest level (just refinement),
+        # progressively wider at coarser levels so we can recover from a bad
+        # moment-based seed (e.g. estimate_initial returning a noisy 4-5°).
+        # L0=0.05 (~2.86°), L1=0.10 (~5.7°), L2=0.15 (~8.6°), L3=0.20 (~11.5°).
+        rot_cap = 0.05 * (level + 1)
         base_ranges = [
             AdaptiveParameters.get_search_range(level, max_level, 0),
             AdaptiveParameters.get_search_range(level, max_level, 1),
-            min(AdaptiveParameters.get_search_range(level, max_level, 2), 0.05),
+            min(AdaptiveParameters.get_search_range(level, max_level, 2), rot_cap),
         ]
-        rng = torch.tensor(base_ranges)
+        rng = torch.tensor(base_ranges, dtype=torch.float64)
 
         Ref_uint8_ravel = Ref_uint8.ravel().double()
         eref = metric_component.precompute_metric(Ref_uint8_ravel)
@@ -488,18 +493,24 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
                                  max_level: int = 4, max_level_seconds: float = 20.0):
         """Powell iterations with per-level patience, min_sweeps and wall-clock timeout.
 
-        Initial best_metric is computed at the seed (not 100000.0) so the
-        anti-drift check inside the goldsearch is meaningful from the very
-        first sweep.
+        Optimizations:
+        - Initial best_metric is computed at the seed (anti-drift baseline
+          is meaningful from the very first sweep).
+        - best_metric is forwarded to goldsearch as `baseline_mi` to skip the
+          redundant evaluation at the seed inside each call.
+        - At the finest level (level=0) the rotation axis is *locked* and only
+          tx/ty are refined: pure refinement of small misalignment.
+        - RNG seed depends on `level` so the shuffled axis order is not the
+          same on every level.
         """
         best_params = par_lin.clone()
         matrix = metric_component.to_matrix_blocked(par_lin)
         best_metric = metric_component.compute_metric(ref_sup_2D, flt_sup, matrix, eref)
 
-        # Per-level budget. Coarser levels deserve more iterations because
-        # they explore the parameter space; the finest level just refines.
+        # Per-level budget. The finest level gets a bit more refinement budget
+        # since it actually drives the sub-pixel accuracy.
         if level == 0:
-            patience, eps, min_sweeps, max_iterations = 1, 0.001,  1, 3
+            patience, eps, min_sweeps, max_iterations = 2, 0.001,  2, 6
         elif level == 1:
             patience, eps, min_sweeps, max_iterations = 2, 0.001,  2, 6
         else:
@@ -508,7 +519,7 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         if max_iterations_override is not None:
             max_iterations = max_iterations_override
 
-        rand_gen = np.random.RandomState(420)
+        rand_gen = np.random.RandomState(420 + level)
         stuck_sweeps = 0
         last_best_metric = best_metric
         level_start = time.monotonic()
@@ -517,8 +528,6 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         while it < max_iterations:
             it += 1
 
-            # Wall-clock guard — bail out and let the next pyramid level take
-            # over rather than spending minutes on a slow backend.
             if time.monotonic() - level_start > max_level_seconds:
                 logger.info(
                     f"[Powell] Level {level}: wall-clock limit "
@@ -526,10 +535,12 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
                 )
                 break
 
-            # Coarse levels: deterministic axis order. Finer levels: shuffle
-            # so any axis order bias does not bake into the result.
-            param_order = [0, 1, 2]
-            if level > 0:
+            # Lock rotation at the finest level (just tx/ty refinement);
+            # at coarser levels shuffle the axis order to avoid bias.
+            if level == 0:
+                param_order = [0, 1]
+            else:
+                param_order = [0, 1, 2]
                 rand_gen.shuffle(param_order)
 
             for param_idx in param_order:
@@ -540,9 +551,9 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
                     cur_par, cur_rng, ref_sup_2D, flt_sup,
                     par_lin, param_idx, metric_component, eref, level,
                     max_level=max_level,
+                    baseline_mi=best_metric,
                 )
 
-                # Accept only if the candidate strictly beats the global best.
                 if cur_mi < best_metric:
                     par_lin[param_idx] = param_opt
                     best_metric = cur_mi
@@ -556,8 +567,6 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
             else:
                 stuck_sweeps += 1
 
-            # Run at least `min_sweeps` so the first few golden-section calls
-            # have a chance to lock in tx/ty/theta in some order.
             if it >= min_sweeps and stuck_sweeps >= patience:
                 break
 
@@ -565,13 +574,18 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         return best_params
 
     def optimize_goldsearch_adaptive(self, par, rng, ref_sup_2D, flt_sup,
-                                     linear_par, i, metric_component, eref, level, max_level: int = 4):
+                                     linear_par, i, metric_component, eref, level, max_level: int = 4,
+                                     baseline_mi=None):
         """Adaptive golden-section search with per-level tuning + anti-drift.
 
         Returns the new parameter only if it strictly improves the metric at
         the seed (`baseline_mi`); otherwise the seed is restored. Without
         this guard a noisy plateau can shift `linear_par[i]` in a direction
         that increases the global cost when reassembled with the other axes.
+
+        ``baseline_mi`` may be passed by Powell when it already knows the
+        metric at the current ``linear_par`` state — this saves one MI
+        evaluation per goldsearch call (~30 evals per level).
         """
         base_threshold = AdaptiveParameters.get_gss_threshold(level, max_level)
         threshold = base_threshold * 5.0
@@ -595,8 +609,11 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
             matrix = metric_component.to_matrix_blocked(linear_par)
             return metric_component.compute_metric(ref_sup_2D, flt_sup, matrix, eref)
 
-        # Anchor metric at the seed — used as the anti-drift baseline.
-        baseline_mi = evaluate_at(par)
+        # Anchor metric at the seed — anti-drift baseline. Skip the evaluation
+        # when Powell already supplied the value (best_metric at the current
+        # par_lin state == baseline at par for this axis).
+        if baseline_mi is None:
+            baseline_mi = evaluate_at(par)
 
         c = end - ratio_2 * (end - start)
         d = start + ratio_2 * (end - start)
