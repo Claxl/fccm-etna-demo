@@ -110,9 +110,9 @@ class FaberFPGAAccelerator:
     def _ensure_buffers(self, rows: int, cols: int):
         """Lazily (re)allocate the input image buffers if the shape changed."""
         if (rows, cols) != self.current_shape:
-            if self.input_flt_buffer:
+            if self.input_flt_buffer is not None:
                 self.input_flt_buffer.freebuffer()
-            if self.input_ref_buffer:
+            if self.input_ref_buffer is not None:
                 self.input_ref_buffer.freebuffer()
 
             # Direct-mapped RAM buffers (no CPU caching)

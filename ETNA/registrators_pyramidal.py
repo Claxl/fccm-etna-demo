@@ -60,6 +60,7 @@ class EtnaMultiMetric(object):
 
         self.compute_metric = None
         self.precompute_metric = None
+        self._hist_edges_cache: dict = {}
         self.ref_vals = torch.ones(ref_size * ref_size, dtype=torch.int, device=self.device)
         self.move_data = None
         self.hist_dim = 256
@@ -102,7 +103,10 @@ class EtnaMultiMetric(object):
 
     def my_squared_hist2d_t(self, sample, bins, smin, smax):
         D, N = sample.shape
-        edges = torch.linspace(smin, smax, bins + 1, device=self.device)
+        cache_key = (bins, smin, smax)
+        if cache_key not in self._hist_edges_cache:
+            self._hist_edges_cache[cache_key] = torch.linspace(smin, smax, bins + 1, device=self.device)
+        edges = self._hist_edges_cache[cache_key]
         nbin = edges.shape[0] + 1
 
         Ncount = D * [None]
