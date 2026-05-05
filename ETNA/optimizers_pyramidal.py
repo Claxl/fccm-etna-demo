@@ -397,9 +397,13 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         Flt_uint8 = self._normalize_to_uint8(flt_tensor, device)
 
         if not use_pyramid or num_levels <= 1:
-            print("[Pyramid] Single-level fallback")
+            print("[Pyramid] Single-level fallback (theta unlocked)")
             start_single = time.time()
-            _, H = self.register_images(Ref_uint8, Flt_uint8, metric_component)
+            # max_level=1 disables the theta-lock at level 0 so rotation is
+            # always a free parameter when there are no coarser levels.
+            _, H = self.register_images_adaptive(
+                Ref_uint8, Flt_uint8, metric_component, max_level=1,
+            )
             print(f"[Pyramid] Single-level time: {time.time() - start_single:.4f}s")
             return H
 
@@ -531,9 +535,10 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
                     f"({max_level_seconds:.0f}s) reached after {it} sweeps.")
                 break
 
-            # Lock rotation at the finest level (just tx/ty refinement);
-            # at coarser levels shuffle the axis order to avoid bias.
-            if level == 0:
+            # Lock rotation at the finest level when a coarser level already
+            # found it (multi-level pyramid only).  With a single level there
+            # is no coarser pass, so theta must remain free.
+            if level == 0 and max_level > 1:
                 param_order = [0, 1]
             else:
                 param_order = [0, 1, 2]

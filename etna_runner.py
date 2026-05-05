@@ -11,6 +11,7 @@ subclass is the only instrumentation point.
 """
 from __future__ import annotations
 
+import json
 import os
 import queue
 import sys
@@ -616,7 +617,7 @@ def run_etna(
     start = time.time()
 
     fpga_active, fpga_status = detect_fpga_status(want_fpga)
-    backend = "FPGA (wax_mi_accel)" if fpga_active else \
+    backend = "FPGA" if fpga_active else \
               ("CPU fallback" if want_fpga else "CPU")
 
     if event_queue is not None:
@@ -768,6 +769,186 @@ def run_etna(
 
 
 # ---------------------------------------------------------------------------
+# Event recording / replay
+# ---------------------------------------------------------------------------
+
+def _event_to_dict(event) -> dict:
+    if isinstance(event, MetricEvent):
+        t = event.transform
+        return {
+            "kind": "metric",
+            "level": event.level,
+            "level_size": event.level_size,
+            "eval_idx": event.eval_idx,
+            "value": event.value,
+            "transform": t.tolist() if t is not None else None,
+            "wall_time": event.wall_time,
+            "step_ms": event.step_ms,
+            "rmse_px": event.rmse_px,
+        }
+    if isinstance(event, LevelEvent):
+        return {
+            "kind": "level",
+            "phase": event.phase,
+            "level": event.level,
+            "level_size": event.level_size,
+            "wall_time": event.wall_time,
+        }
+    if isinstance(event, StatusEvent):
+        return {
+            "kind": "status",
+            "message": event.message,
+            "severity": event.severity,
+            "payload": event.payload,
+            "wall_time": event.wall_time,
+        }
+    return {"kind": "unknown"}
+
+
+def _dict_to_event(row: dict):
+    kind = row.get("kind", "")
+    if kind == "metric":
+        t = row.get("transform")
+        return MetricEvent(
+            level=row.get("level", -1),
+            level_size=row.get("level_size", 0),
+            eval_idx=row.get("eval_idx", 0),
+            value=row.get("value", 0.0),
+            transform=np.array(t, dtype=np.float32) if t is not None else None,
+            wall_time=row.get("wall_time", 0.0),
+            step_ms=row.get("step_ms", 0.0),
+            rmse_px=row.get("rmse_px"),
+        )
+    if kind == "level":
+        return LevelEvent(
+            phase=row.get("phase", "start"),
+            level=row.get("level", -1),
+            level_size=row.get("level_size", 0),
+            wall_time=row.get("wall_time", 0.0),
+        )
+    if kind == "status":
+        return StatusEvent(
+            message=row.get("message", ""),
+            severity=row.get("severity", "info"),
+            payload=row.get("payload") or {},
+            wall_time=row.get("wall_time", 0.0),
+        )
+    return StatusEvent(message=f"[unknown event kind={kind}]", severity="info")
+
+
+class RecordingQueue:
+    """queue.Queue wrapper that tees every put() to a JSONL file.
+
+    Pass as the ``event_queue`` to ``run_etna`` to record a session.
+    The inner queue is still drained by the Aggregator as usual.
+    """
+
+    def __init__(self, record_path: Path | str):
+        self._inner: queue.Queue = queue.Queue()
+        self._path = Path(record_path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = None
+        self._start: float = 0.0
+        self._lock = threading.Lock()
+
+    def open(self) -> None:
+        self._file = open(self._path, "w", encoding="utf-8")
+        self._start = time.time()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._file is not None:
+                try:
+                    self._file.flush()
+                    self._file.close()
+                except Exception:
+                    pass
+                self._file = None
+
+    def _write(self, event) -> None:
+        with self._lock:
+            if self._file is None:
+                return
+            try:
+                row = {"t": round(time.time() - self._start, 4),
+                       **_event_to_dict(event)}
+                self._file.write(json.dumps(row) + "\n")
+            except Exception as exc:
+                print(f"WARNING: RecordingQueue write error: {exc}")
+
+    # --- queue.Queue-compatible interface ---
+
+    def put(self, item, block=True, timeout=None):
+        self._inner.put(item, block=block, timeout=timeout)
+        self._write(item)
+
+    def put_nowait(self, item):
+        self._inner.put_nowait(item)
+        self._write(item)
+
+    def get(self, block=True, timeout=None):
+        return self._inner.get(block=block, timeout=timeout)
+
+    def empty(self) -> bool:
+        return self._inner.empty()
+
+    def qsize(self) -> int:
+        return self._inner.qsize()
+
+
+def replay_events(jsonl_path: str | Path, event_queue: queue.Queue,
+                  speed: float = 1.0) -> None:
+    """Read a JSONL recording and push events onto ``event_queue``, honouring
+    the recorded wall-clock spacing scaled by ``speed``."""
+    rows: list[dict] = []
+    with open(jsonl_path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    if not rows:
+        return
+    t0 = time.time()
+    for row in rows:
+        target = row.get("t", 0.0) / max(speed, 1e-6)
+        wait = target - (time.time() - t0)
+        if wait > 0:
+            time.sleep(wait)
+        event_queue.put(_dict_to_event(row))
+
+
+def run_replay_async(
+    jsonl_path: str | Path,
+    *,
+    num_pyramid_levels: int = 4,
+    speed: float = 1.0,
+    event_queue: "queue.Queue | None" = None,
+) -> "tuple[threading.Thread, Aggregator, dict]":
+    """Like ``run_etna_async`` but sources events from a JSONL recording."""
+    if event_queue is None:
+        event_queue = queue.Queue()
+    result_slot: dict = {}
+
+    def _worker():
+        try:
+            replay_events(jsonl_path, event_queue, speed=speed)
+            result_slot["result"] = None
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            result_slot["error"] = exc
+
+    t = threading.Thread(target=_worker, name="etna-replayer", daemon=True)
+    aggregator = Aggregator(
+        event_queue=event_queue, num_levels=num_pyramid_levels,
+        result_slot=result_slot, worker_thread=t,
+    )
+    t.start()
+    aggregator.start()
+    return t, aggregator, result_slot
+
+
+# ---------------------------------------------------------------------------
 # Power sampler (xlnx_platformstats)
 # ---------------------------------------------------------------------------
 
@@ -818,6 +999,7 @@ class PowerSampler:
 def run_etna_async(fixed_img, moving_img, *, device, metric, optimizer, ref_size,
                    event_queue, gt_mat_path: str | Path | None = None,
                    num_pyramid_levels: int = 4,
+                   record_path: str | Path | None = None,
                    ) -> tuple[threading.Thread, Aggregator, dict]:
     """Launch ``run_etna`` on a background thread *and* a snapshot aggregator.
 
@@ -834,12 +1016,21 @@ def run_etna_async(fixed_img, moving_img, *, device, metric, optimizer, ref_size
     """
     result_slot: dict = {}
 
+    # Optionally tee every event to a JSONL file for later replay.
+    rec_queue: RecordingQueue | None = None
+    if record_path is not None:
+        rec_queue = RecordingQueue(record_path)
+        rec_queue.open()
+        work_queue = rec_queue
+    else:
+        work_queue = event_queue
+
     def _worker():
         try:
             result_slot["result"] = run_etna(
                 fixed_img, moving_img,
                 device=device, metric=metric, optimizer=optimizer,
-                ref_size=ref_size, event_queue=event_queue,
+                ref_size=ref_size, event_queue=work_queue,
                 gt_mat_path=gt_mat_path,
                 num_pyramid_levels=num_pyramid_levels,
             )
@@ -848,13 +1039,16 @@ def run_etna_async(fixed_img, moving_img, *, device, metric, optimizer, ref_size
             print("ERROR: ETNA worker crashed")
             traceback.print_exc()
             result_slot["error"] = exc
+        finally:
+            if rec_queue is not None:
+                rec_queue.close()
 
     t = threading.Thread(target=_worker, name="etna-runner", daemon=True)
     aggregator = Aggregator(
-        event_queue=event_queue, num_levels=num_pyramid_levels,
+        event_queue=work_queue, num_levels=num_pyramid_levels,
         result_slot=result_slot, worker_thread=t,
     )
-    power_sampler = PowerSampler(event_queue=event_queue, worker_thread=t)
+    power_sampler = PowerSampler(event_queue=work_queue, worker_thread=t)
     t.start()
     aggregator.start()
     power_sampler.start()
@@ -869,17 +1063,37 @@ if __name__ == "__main__":
     import argparse
     import cv2
 
-    p = argparse.ArgumentParser(description="ETNA runner smoke test")
-    p.add_argument("fixed")
-    p.add_argument("moving")
+    p = argparse.ArgumentParser(description="ETNA runner smoke test / recorder")
+    p.add_argument("fixed", nargs="?", help="path to fixed image (omit for --replay)")
+    p.add_argument("moving", nargs="?", help="path to moving image (omit for --replay)")
     p.add_argument("--device", choices=["cpu", "fpga"], default="cpu")
     p.add_argument("--metric", choices=["mi", "mse", "cc"], default="mi")
     p.add_argument("--optimizer", choices=["powell", "oneplusone"], default="powell")
     p.add_argument("--ref-size", type=int, default=256)
     p.add_argument("--gt", help="path to a STAR-Bench .mat ground-truth file")
+    p.add_argument("--record", metavar="PATH",
+                   help="record events to a JSONL file for later replay")
+    p.add_argument("--replay", metavar="PATH",
+                   help="replay a previously recorded JSONL file")
+    p.add_argument("--speed", type=float, default=1.0,
+                   help="replay speed multiplier (default 1.0 = real-time)")
+    p.add_argument("--levels", type=int, default=4)
     args = p.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if args.replay:
+        print(f"Replaying {args.replay} at {args.speed}x speed …")
+        _rq: queue.Queue = queue.Queue()
+        _rt, _ragg, _rslot = run_replay_async(
+            args.replay, num_pyramid_levels=args.levels,
+            speed=args.speed, event_queue=_rq,
+        )
+        _rt.join()
+        snap = _ragg.get_snapshot()
+        print(f"replay done — {snap.total_evals} evals replayed")
+        raise SystemExit(0)
+
+    if not args.fixed or not args.moving:
+        p.error("fixed and moving images are required (unless --replay is used)")
 
     fixed = cv2.imread(args.fixed, cv2.IMREAD_GRAYSCALE)
     moving = cv2.imread(args.moving, cv2.IMREAD_GRAYSCALE)
@@ -895,4 +1109,6 @@ if __name__ == "__main__":
         print(f"landmark RMSE: initial = {res.initial_rmse_px:.3f} px, "
               f"final = {res.final_rmse_px:.3f} px")
     print("transform =\n", res.transform)
-    print("queue events =", q.qsize())
+
+    if args.record:
+        print(f"\nTo replay: python etna_runner.py --replay {args.record}")
