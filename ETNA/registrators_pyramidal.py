@@ -285,9 +285,17 @@ class EtnaMultiMetric(object):
 
         roundness = (flt_mom[2] / flt_mom[0]) / (flt_mom[4] / flt_mom[0])
         if torch.abs(roundness - 1.0) >= 0.3:
+            # Match to_matrix_blocked's convention [cos, +sin; -sin, cos]
+            # (kornia inverse-mapping). Before this fix the sins were
+            # transposed, so atan2(H_init[0][1], H_init[0][0]) at the
+            # coarsest level returned -delta_rho — i.e. seeded the optimizer
+            # with the rotation in the wrong direction, costing ~7 px RMSE
+            # on test pairs with non-trivial rotation. Old code happened to
+            # work because OLD to_matrix_blocked packed cos directly and
+            # implicitly transposed via sqrt(1-cos²).
             params[0][0] = torch.cos(delta_rho)
-            params[0][1] = -torch.sin(delta_rho)
-            params[1][0] = torch.sin(delta_rho)
+            params[0][1] = torch.sin(delta_rho)
+            params[1][0] = -torch.sin(delta_rho)
             params[1][1] = torch.cos(delta_rho)
         else:
             params[0][0] = 1.0
