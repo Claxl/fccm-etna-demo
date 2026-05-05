@@ -32,10 +32,7 @@ _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
-logger = logging.getLogger(__name__)
-
 from ETNA import EtnaMultiMetric, EtnaMultiPowell, EtnaMultiOnePlusOne  # noqa: E402
-from gt_loader import load_ground_truth as _sb_load  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Xilinx platform-stats (power monitoring) — optional
@@ -46,6 +43,9 @@ _XLNX_BINDINGS = (
     / "xlnx_platformstats"
     / "python-bindings"
 )
+
+logger = logging.getLogger(__name__)
+
 XPLATFORMSTATS_AVAILABLE = False
 _xlnx = None
 try:
@@ -58,6 +58,7 @@ try:
     logger.info("xlnx_platformstats found — real-time power monitoring enabled.")
 except Exception as _xlnx_err:
     logger.warning("xlnx_platformstats not available: %s", _xlnx_err)
+from gt_loader import load_ground_truth as _sb_load  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -237,8 +238,12 @@ class Aggregator:
 
     @staticmethod
     def _recompute_qac(snap: LiveSnapshot) -> None:
-        if snap.best_rmse != float("inf") and snap.current_power_w is not None:
-            denom = snap.best_rmse + snap.current_power_w
+        if (snap.best_rmse != float("inf")
+                and snap.current_power_w is not None
+                and snap.last_step_ms is not None):
+            # EN = energy per step: raw µW → W, step_ms → s
+            en = (snap.current_power_w / 1_000_000) * (snap.last_step_ms / 1000)
+            denom = snap.best_rmse + en
             snap.qac = (100.0 / denom) if denom > 0 else None
 
     def _apply(self, evt) -> None:
@@ -280,6 +285,7 @@ class Aggregator:
             elif isinstance(evt, MetricEvent):
                 snap.total_evals += 1
                 snap.last_step_ms = evt.step_ms
+                self._recompute_qac(snap)
                 lvl = max(0, min(self._num_levels - 1, evt.level))
                 snap.series.setdefault(lvl, []).append((snap.total_evals, evt.value))
                 if evt.rmse_px is not None and not (evt.rmse_px != evt.rmse_px):

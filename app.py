@@ -577,7 +577,7 @@ def _run_and_stream():
             render_kpi(rmse_kpi_slot, "RMSE (px)",
                        f"{snap.initial_rmse:.1f} → …", "#f39c12")
         if snap.current_power_w is not None:
-            render_kpi(power_slot, "Power (W)", f"{snap.current_power_w:.2f}")
+            render_kpi(power_slot, "Power (W)", f"{snap.current_power_w / 1_000_000:.2f}")
         if snap.qac is not None:
             render_kpi(qac_slot, "QAC", f"{snap.qac:.3f}")
 
