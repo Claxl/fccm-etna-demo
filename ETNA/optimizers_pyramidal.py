@@ -497,22 +497,28 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         Optimizations kept (pure speed wins, no accuracy cost):
         - Initial best_metric is computed at the seed (anti-drift baseline
           is meaningful from the very first sweep).
-        - best_metric is forwarded to goldsearch as `baseline_mi` to skip the
-          redundant evaluation at the seed inside each call. ~30 MI evals
-          saved per level, ~24s on FPGA.
-        - RNG seed depends on `level` so the shuffled axis order differs
-          across pyramid levels.
+        - On CPU only: best_metric is forwarded to goldsearch as
+          ``baseline_mi`` to skip the redundant evaluation at the seed.
+          On FPGA the metric has small per-call jitter that breaks the
+          anti-drift comparison if the baseline is stale, so we always
+          recompute it inside goldsearch when ``use_fpga=True``.
 
         Reverted (was costing accuracy):
         - Theta-lock at level 0: refining theta at the finest level is
-          required to recover sub-pixel both on CPU and FPGA. Locking it
-          left a ~0.5 px residual on FPGA.
-        - Per-level L0 budget bump (2,2,6): the original (1,1,3) is enough
-          when theta is refined.
+          required to recover sub-pixel both on CPU and FPGA.
+        - Per-level L0 budget bump (2,2,6): (1,1,3) matches baseline.
+        - Per-level RNG seed (420 + level): reverted to RandomState(420)
+          so the axis-shuffle trajectory matches baseline on every level.
         """
         best_params = par_lin.clone()
         matrix = metric_component.to_matrix_blocked(par_lin)
         best_metric = metric_component.compute_metric(ref_sup_2D, flt_sup, matrix, eref)
+
+        # On FPGA, forwarding best_metric as baseline_mi breaks the anti-drift
+        # check in goldsearch: HW MI has small per-call jitter, so a stale
+        # baseline biases the accept/reject decision and theta drifts off at
+        # L0. CPU MI is bit-deterministic, so the forwarding stays a free win.
+        forward_baseline = not getattr(metric_component, 'use_fpga', False)
 
         # Per-level budget. Coarser levels deserve more iterations because
         # they explore the parameter space; the finest level just refines.
@@ -526,7 +532,7 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         if max_iterations_override is not None:
             max_iterations = max_iterations_override
 
-        rand_gen = np.random.RandomState(420 + level)
+        rand_gen = np.random.RandomState(420)
         stuck_sweeps = 0
         last_best_metric = best_metric
         level_start = time.monotonic()
@@ -557,7 +563,7 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
                     cur_par, cur_rng, ref_sup_2D, flt_sup,
                     par_lin, param_idx, metric_component, eref, level,
                     max_level=max_level,
-                    baseline_mi=best_metric,
+                    baseline_mi=best_metric if forward_baseline else None,
                 )
 
                 if cur_mi < best_metric:
