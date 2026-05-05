@@ -510,7 +510,7 @@ def _run_and_stream():
                 showlegend=True, legend=dict(orientation="h", y=-0.2),
             )
             curve_slot.plotly_chart(fig, width="stretch",
-                                    key=f"curve-{snap.total_evals}")
+                                    key=f"curve-v{snap.version}")
 
         # RMSE curve — rebuild only if the rmse series grew.
         rmse_changed = any(
@@ -553,7 +553,7 @@ def _run_and_stream():
                 showlegend=True, legend=dict(orientation="h", y=-0.2),
             )
             rmse_slot.plotly_chart(rmse_fig, width="stretch",
-                                   key=f"rmse-{snap.total_evals}")
+                                   key=f"rmse-v{snap.version}")
 
         if snap.last_transform is not None:
             matrix_slot.markdown(
