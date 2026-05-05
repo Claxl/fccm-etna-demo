@@ -94,6 +94,14 @@ class FaberFPGAAccelerator:
             return
 
         try:
+            # PYNQ uses asyncio for device discovery; Streamlit's ScriptRunner
+            # thread has no event loop — create one if needed.
+            import asyncio
+            try:
+                asyncio.get_event_loop()
+            except RuntimeError:
+                asyncio.set_event_loop(asyncio.new_event_loop())
+
             logger.info(f"Loading FPGA Overlay: {overlay_path}...")
             self.overlay = Overlay(overlay_path)
 

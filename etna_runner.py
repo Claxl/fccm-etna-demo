@@ -667,7 +667,7 @@ def run_etna(
     warped = cv2.warpAffine(
         moving_img if moving_img.shape[0] == ref_size else
         cv2.resize(moving_img, (ref_size, ref_size), interpolation=cv2.INTER_AREA),
-        H.astype(np.float32), (ref_size, ref_size),
+        np.asarray(H, dtype=np.float32), (ref_size, ref_size),
         flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
 
