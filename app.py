@@ -480,19 +480,23 @@ def _run_and_stream(compare: bool = False, replay_path: str | None = None):
             num_pyramid_levels=num_levels,
         )
         st.markdown("##### FPGA vs CPU live comparison")
-        _cpu_cols = st.columns(6)
+        _cpu_cols = st.columns(8)
         cpu_kpi["backend"] = _cpu_cols[0].empty()
         cpu_kpi["level"]   = _cpu_cols[1].empty()
         cpu_kpi["eval"]    = _cpu_cols[2].empty()
-        cpu_kpi["rate"]    = _cpu_cols[3].empty()
-        cpu_kpi["rmse"]    = _cpu_cols[4].empty()
-        cpu_kpi["time"]    = _cpu_cols[5].empty()
+        cpu_kpi["time"]    = _cpu_cols[3].empty()
+        cpu_kpi["rate"]    = _cpu_cols[4].empty()
+        cpu_kpi["rmse"]    = _cpu_cols[5].empty()
+        cpu_kpi["power"]   = _cpu_cols[6].empty()
+        cpu_kpi["qac"]     = _cpu_cols[7].empty()
         render_kpi(cpu_kpi["backend"], "CPU Backend", "CPU", "#3498db")
         render_kpi(cpu_kpi["level"],   "CPU Level",   "—")
         render_kpi(cpu_kpi["eval"],    "CPU Evals",   "0")
+        render_kpi(cpu_kpi["time"],    "CPU Elapsed", "—")
         render_kpi(cpu_kpi["rate"],    "CPU ms/step", "—")
         render_kpi(cpu_kpi["rmse"],    "CPU RMSE",    "—")
-        render_kpi(cpu_kpi["time"],    "CPU Elapsed", "—")
+        render_kpi(cpu_kpi["power"],   "CPU Power (W)", "—")
+        render_kpi(cpu_kpi["qac"],     "CPU QAC",     "—")
 
     status_msg = st.empty()
     if replay_path:
@@ -528,8 +532,14 @@ def _run_and_stream(compare: bool = False, replay_path: str | None = None):
                 "#27ae60" if snap.fpga_active else "#3498db",
             )
 
+        # Only break the no-change short-circuit when *both* runs are done.
+        cpu_finished = (
+            cpu_aggregator is None
+            or (cpu_aggregator.get_snapshot().done and not cpu_thread.is_alive())
+        )
         if snap.version == last_seen_version:
-            if snap.done or not (thread.is_alive() or aggregator.is_running()):
+            main_finished = snap.done and not thread.is_alive()
+            if main_finished and cpu_finished:
                 break
             time.sleep(0.05)
             continue
@@ -661,7 +671,11 @@ def _run_and_stream(compare: bool = False, replay_path: str | None = None):
         # CPU comparison KPI update.
         if cpu_aggregator is not None:
             cpu_snap = cpu_aggregator.get_snapshot()
-            cpu_elapsed = time.time() - run_start
+            # Freeze the CPU elapsed display once the CPU run has finished
+            # (so a still-running FPGA does not keep ticking the CPU timer).
+            if cpu_snap.done and "cpu_total_time" not in cpu_kpi:
+                cpu_kpi["cpu_total_time"] = time.time() - run_start
+            cpu_elapsed = cpu_kpi.get("cpu_total_time", time.time() - run_start)
             render_kpi(cpu_kpi["eval"],  "CPU Evals",   str(cpu_snap.total_evals))
             render_kpi(cpu_kpi["time"],  "CPU Elapsed", f"{cpu_elapsed:.1f} s")
             if cpu_snap.last_step_ms is not None:
@@ -676,6 +690,11 @@ def _run_and_stream(compare: bool = False, replay_path: str | None = None):
                 render_kpi(cpu_kpi["rmse"], "CPU RMSE",
                            f"{cpu_snap.initial_rmse:.1f}→{cpu_snap.best_rmse:.2f}",
                            delta_col)
+            if cpu_snap.current_power_w is not None:
+                render_kpi(cpu_kpi["power"], "CPU Power (W)",
+                           f"{cpu_snap.current_power_w / 1_000_000:.2f}")
+            if cpu_snap.qac is not None:
+                render_kpi(cpu_kpi["qac"], "CPU QAC", f"{cpu_snap.qac:.3f}")
 
         # Done when main run finished AND cpu run finished (if any).
         main_done = snap.done and not thread.is_alive()

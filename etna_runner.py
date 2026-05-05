@@ -952,9 +952,17 @@ def run_replay_async(
 # Power sampler (xlnx_platformstats)
 # ---------------------------------------------------------------------------
 
+_XLNX_INIT_LOCK = threading.Lock()
+_XLNX_INITIALIZED = False
+
+
 class PowerSampler:
     """Daemon thread that polls xlnx_platformstats and injects power readings
-    as lightweight StatusEvents so the Aggregator can keep QAC up to date."""
+    as lightweight StatusEvents so the Aggregator can keep QAC up to date.
+
+    ``_xlnx.init()`` is called at most once per process (guarded by a module-
+    level flag) so multiple concurrent samplers — e.g. FPGA + CPU compare mode
+    — can coexist without re-initialising the bindings."""
 
     def __init__(self, event_queue: queue.Queue,
                  worker_thread: threading.Thread,
@@ -971,10 +979,16 @@ class PowerSampler:
             self._thread.start()
 
     def _run(self) -> None:
-        try:
-            _xlnx.init()
-        except Exception as e:
-            print("WARNING: xlnx init failed in PowerSampler: %s" % (e,))
+        global _XLNX_INITIALIZED
+        with _XLNX_INIT_LOCK:
+            if not _XLNX_INITIALIZED:
+                try:
+                    _xlnx.init()
+                    _XLNX_INITIALIZED = True
+                except Exception as e:
+                    print("WARNING: xlnx init failed in PowerSampler: %s" % (e,))
+                    return
+        if not _XLNX_INITIALIZED:
             return
         while self._worker.is_alive():
             try:
