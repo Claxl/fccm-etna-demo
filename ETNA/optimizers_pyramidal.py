@@ -464,15 +464,14 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         # downcasts in the comparisons inside golden-section search.
         pa = torch.tensor([tx, ty, theta], dtype=torch.float64)
 
-        # Adaptive rotation cap: tight at the finest level (just refinement),
-        # progressively wider at coarser levels so we can recover from a bad
-        # moment-based seed (e.g. estimate_initial returning a noisy 4-5°).
-        # L0=0.05 (~2.86°), L1=0.10 (~5.7°), L2=0.15 (~8.6°), L3=0.20 (~11.5°).
-        rot_cap = 0.05 * (level + 1)
+        # Cap rotation search range at 0.05 rad (~2.86°) at every level. The
+        # translation ranges from FaberHyperParams are fine, but a wider
+        # rotation bracket (tried with 0.05*(level+1)) lets MI noise at L2/L3
+        # pull theta off and the error never recovers at finer levels.
         base_ranges = [
             AdaptiveParameters.get_search_range(level, max_level, 0),
             AdaptiveParameters.get_search_range(level, max_level, 1),
-            min(AdaptiveParameters.get_search_range(level, max_level, 2), rot_cap),
+            min(AdaptiveParameters.get_search_range(level, max_level, 2), 0.05),
         ]
         rng = torch.tensor(base_ranges, dtype=torch.float64)
 
@@ -495,24 +494,30 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
                                  max_level: int = 4, max_level_seconds: float = 20.0):
         """Powell iterations with per-level patience, min_sweeps and wall-clock timeout.
 
-        Optimizations:
+        Optimizations kept (pure speed wins, no accuracy cost):
         - Initial best_metric is computed at the seed (anti-drift baseline
           is meaningful from the very first sweep).
         - best_metric is forwarded to goldsearch as `baseline_mi` to skip the
-          redundant evaluation at the seed inside each call.
-        - At the finest level (level=0) the rotation axis is *locked* and only
-          tx/ty are refined: pure refinement of small misalignment.
-        - RNG seed depends on `level` so the shuffled axis order is not the
-          same on every level.
+          redundant evaluation at the seed inside each call. ~30 MI evals
+          saved per level, ~24s on FPGA.
+        - RNG seed depends on `level` so the shuffled axis order differs
+          across pyramid levels.
+
+        Reverted (was costing accuracy):
+        - Theta-lock at level 0: refining theta at the finest level is
+          required to recover sub-pixel both on CPU and FPGA. Locking it
+          left a ~0.5 px residual on FPGA.
+        - Per-level L0 budget bump (2,2,6): the original (1,1,3) is enough
+          when theta is refined.
         """
         best_params = par_lin.clone()
         matrix = metric_component.to_matrix_blocked(par_lin)
         best_metric = metric_component.compute_metric(ref_sup_2D, flt_sup, matrix, eref)
 
-        # Per-level budget. The finest level gets a bit more refinement budget
-        # since it actually drives the sub-pixel accuracy.
+        # Per-level budget. Coarser levels deserve more iterations because
+        # they explore the parameter space; the finest level just refines.
         if level == 0:
-            patience, eps, min_sweeps, max_iterations = 2, 0.001,  2, 6
+            patience, eps, min_sweeps, max_iterations = 1, 0.001,  1, 3
         elif level == 1:
             patience, eps, min_sweeps, max_iterations = 2, 0.001,  2, 6
         else:
@@ -535,16 +540,13 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
                     f"({max_level_seconds:.0f}s) reached after {it} sweeps.")
                 break
 
-            # Lock theta at L0 ONLY for FPGA runs: saves ~30% evaluations on the
-            # accelerator path. For CPU the extra theta sweeps are cheap and
-            # the residual rotation from L1 can still be ~0.002 rad which
-            # projects to ~0.5 px at 512 px scale — enough to lose sub-pixel
-            # accuracy. Single-level runs always keep theta free (max_level==1).
-            fpga_run = getattr(metric_component, 'use_fpga', False)
-            if level == 0 and max_level > 1 and fpga_run:
-                param_order = [0, 1]
-            else:
-                param_order = [0, 1, 2]
+            # All levels sweep all 3 axes. Locking theta at L0 was tried as a
+            # speed shortcut on FPGA, but it left a residual rotation that
+            # cost sub-pixel accuracy. Coarse levels use a deterministic axis
+            # order; finer levels shuffle so any axis-order bias does not
+            # bake into the result.
+            param_order = [0, 1, 2]
+            if level > 0:
                 rand_gen.shuffle(param_order)
 
             for param_idx in param_order:
