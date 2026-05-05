@@ -27,7 +27,7 @@ class EtnaMultiMetric(object):
     """Pyramidal ETNA_Multi metric component (MI / MSE / CC / Parzen)."""
 
     def __init__(self, ref_size=512, metric="mi", transform="wax",
-                 exponential=True, interpolation="nearest", use_fpga=False):
+                 exponential=True, interpolation="bilinear", use_fpga=False):
         object.__init__(self)
         self.ref_entropy = 0
         self.ref_size = ref_size
@@ -250,19 +250,19 @@ class EtnaMultiMetric(object):
         return moments
 
     def to_matrix_blocked(self, vector_params):
-        mat_params = torch.empty((2, 3))
+        """Build a 2x3 rigid transform from [tx, ty, theta] (theta in radians).
+
+        Convention matches estimate_initial after the atan2 conversion in
+        register_images_adaptive: M = [[cos θ, sin θ, tx], [-sin θ, cos θ, ty]].
+        """
+        mat_params = torch.empty((2, 3), device=self.device)
         mat_params[0][2] = vector_params[0]
         mat_params[1][2] = vector_params[1]
-        if vector_params[2] > 1 or vector_params[2] < -1:
-            mat_params[0][0] = 1
-            mat_params[1][1] = 1
-            mat_params[0][1] = 0
-            mat_params[1][0] = 0
-        else:
-            mat_params[0][0] = vector_params[2]
-            mat_params[1][1] = vector_params[2]
-            mat_params[0][1] = torch.sqrt(1 - (vector_params[2] ** 2))
-            mat_params[1][0] = -mat_params[0][1]
+        theta = vector_params[2]
+        mat_params[0][0] = torch.cos(theta)
+        mat_params[1][1] = torch.cos(theta)
+        mat_params[0][1] = torch.sin(theta)
+        mat_params[1][0] = -torch.sin(theta)
         return mat_params
 
     def estimate_initial(self, Ref_uint8, Flt_uint8, params):

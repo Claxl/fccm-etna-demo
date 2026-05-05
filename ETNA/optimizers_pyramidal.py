@@ -442,29 +442,32 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         return level_transforms[0]
 
     def register_images_adaptive(self, Ref_uint8, Flt_uint8, metric_component, H_init=None, level=0, max_iterations_override=None, max_level: int = 4):
-        params = torch.empty((2, 3), device=metric_component.device)
-        params_cpu = params.cpu()
-
-        # Seed from previous level, or start from identity
+        import math
+        # Seed from previous level, or start from identity. The Powell loop
+        # operates on the 3-vector [tx, ty, theta] with theta in radians.
         if H_init is not None:
-            params_cpu[0][2] = torch.tensor(H_init[0][2])
-            params_cpu[1][2] = torch.tensor(H_init[1][2])
-            params_cpu[0][0] = torch.tensor(H_init[0][0])
-            params_cpu[1][0] = torch.tensor(H_init[1][0])
+            tx = float(H_init[0][2])
+            ty = float(H_init[1][2])
+            # to_matrix_blocked uses [cos θ, sin θ; -sin θ, cos θ], so
+            # H[0][1] = sin θ and H[0][0] = cos θ; both estimate_initial and
+            # this convention give the same atan2 result (see analysis).
+            theta = math.atan2(float(H_init[0][1]), float(H_init[0][0]))
         else:
-            params_cpu[0][2] = 0.0
-            params_cpu[1][2] = 0.0
-            params_cpu[0][0] = 1.0
-            params_cpu[1][0] = 1.0
+            tx = 0.0
+            ty = 0.0
+            theta = 0.0
 
+        pa = torch.tensor([tx, ty, theta], dtype=torch.float32)
+
+        # Cap rotation search range at 0.05 rad (~2.86°). The translation
+        # ranges from FaberHyperParams (40 px) are fine, but using the same
+        # numeric range for rotation makes the optimizer diverge.
         base_ranges = [
             AdaptiveParameters.get_search_range(level, max_level, 0),
             AdaptiveParameters.get_search_range(level, max_level, 1),
-            AdaptiveParameters.get_search_range(level, max_level, 2),
+            min(AdaptiveParameters.get_search_range(level, max_level, 2), 0.05),
         ]
-
         rng = torch.tensor(base_ranges)
-        pa = torch.tensor([params_cpu[0][2], params_cpu[1][2], params_cpu[0][0]])
 
         Ref_uint8_ravel = Ref_uint8.ravel().double()
         eref = metric_component.precompute_metric(Ref_uint8_ravel)
@@ -483,44 +486,48 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
     def optimize_powell_adaptive(self, rng, par_lin, ref_sup_2D, flt_sup,
                                  metric_component, eref, level, max_iterations_override=None,
                                  max_level: int = 4, max_level_seconds: float = 20.0):
-        """Powell iterations with per-level tolerance, patience, and wall-clock timeout."""
-        converged = False
-        eps = AdaptiveParameters.get_tolerance(level, max_level, 'powell')
-        max_iterations = max_iterations_override or AdaptiveParameters.get_iterations(level, max_level, 'powell')
+        """Powell iterations with per-level patience, min_sweeps and wall-clock timeout.
 
-        last_mut = 100000.0
-        it = 0
+        Initial best_metric is computed at the seed (not 100000.0) so the
+        anti-drift check inside the goldsearch is meaningful from the very
+        first sweep.
+        """
         best_params = par_lin.clone()
-        best_metric = last_mut
+        matrix = metric_component.to_matrix_blocked(par_lin)
+        best_metric = metric_component.compute_metric(ref_sup_2D, flt_sup, matrix, eref)
+
+        # Per-level budget. Coarser levels deserve more iterations because
+        # they explore the parameter space; the finest level just refines.
+        if level == 0:
+            patience, eps, min_sweeps, max_iterations = 1, 0.001,  1, 3
+        elif level == 1:
+            patience, eps, min_sweeps, max_iterations = 2, 0.001,  2, 6
+        else:
+            patience, eps, min_sweeps, max_iterations = 3, 0.0005, 2, 10
+
+        if max_iterations_override is not None:
+            max_iterations = max_iterations_override
 
         rand_gen = np.random.RandomState(420)
-
-        # Two complementary early-stop mechanisms:
-        # 1. Patience: exit when best_metric has not improved by >eps for
-        #    `patience` consecutive sweeps (local-minimum detection).
-        # 2. Wall-clock: exit when we have spent more than `max_level_seconds`
-        #    on this pyramid level (prevents multi-minute hangs with slow
-        #    per-eval backends such as the FPGA kernel).
-        patience = max(3, max_iterations // 20)
         stuck_sweeps = 0
         last_best_metric = best_metric
         level_start = time.monotonic()
+        it = 0
 
-        while not converged and it < max_iterations:
-            converged = True
+        while it < max_iterations:
             it += 1
 
-            # Wall-clock guard — check once per sweep (cheap).
+            # Wall-clock guard — bail out and let the next pyramid level take
+            # over rather than spending minutes on a slow backend.
             if time.monotonic() - level_start > max_level_seconds:
                 logger.info(
                     f"[Powell] Level {level}: wall-clock limit "
-                    f"({max_level_seconds:.0f}s) reached after {it} sweeps, "
-                    "advancing to next pyramid level."
+                    f"({max_level_seconds:.0f}s) reached after {it} sweeps."
                 )
                 break
 
-            # At the coarse level we keep the axis order fixed so that the
-            # initial sweep is deterministic; finer levels shuffle.
+            # Coarse levels: deterministic axis order. Finer levels: shuffle
+            # so any axis order bias does not bake into the result.
             param_order = [0, 1, 2]
             if level > 0:
                 rand_gen.shuffle(param_order)
@@ -535,15 +542,11 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
                     max_level=max_level,
                 )
 
-                par_lin[param_idx] = cur_par
-                improvement = last_mut - cur_mi
-                if improvement > eps:
+                # Accept only if the candidate strictly beats the global best.
+                if cur_mi < best_metric:
                     par_lin[param_idx] = param_opt
-                    last_mut = cur_mi
-                    converged = False
-                    if cur_mi < best_metric:
-                        best_metric = cur_mi
-                        best_params = par_lin.clone()
+                    best_metric = cur_mi
+                    best_params = par_lin.clone()
                 else:
                     par_lin[param_idx] = cur_par
 
@@ -552,97 +555,92 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
                 stuck_sweeps = 0
             else:
                 stuck_sweeps += 1
-            if stuck_sweeps >= patience:
-                logger.info(
-                    f"[Powell] Level {level}: stuck at local min for "
-                    f"{stuck_sweeps} sweeps, advancing to next pyramid level."
-                )
+
+            # Run at least `min_sweeps` so the first few golden-section calls
+            # have a chance to lock in tx/ty/theta in some order.
+            if it >= min_sweeps and stuck_sweeps >= patience:
                 break
 
+        par_lin.copy_(best_params)
         return best_params
 
     def optimize_goldsearch_adaptive(self, par, rng, ref_sup_2D, flt_sup,
                                      linear_par, i, metric_component, eref, level, max_level: int = 4):
-        """Adaptive golden-section search with per-level tuning."""
+        """Adaptive golden-section search with per-level tuning + anti-drift.
+
+        Returns the new parameter only if it strictly improves the metric at
+        the seed (`baseline_mi`); otherwise the seed is restored. Without
+        this guard a noisy plateau can shift `linear_par[i]` in a direction
+        that increases the global cost when reassembled with the other axes.
+        """
         base_threshold = AdaptiveParameters.get_gss_threshold(level, max_level)
         threshold = base_threshold * 5.0
 
         if level == 0:
-            max_it = 15
+            max_it, metric_tol, flat_patience_limit, range_multiplier = 10, 0.001,  2, 0.3
         elif level == 1:
-            max_it = 25
+            max_it, metric_tol, flat_patience_limit, range_multiplier = 15, 0.0005, 3, 0.5
         else:
-            max_it = 40
+            max_it, metric_tol, flat_patience_limit, range_multiplier = 20, 0.0002, 3, 1.0
 
-        ratio_1 = 0.382
-        ratio_2 = 0.618
-
-        range_multiplier = 1.0
-        if level == 0:
-            range_multiplier = 0.3
-        elif level == 1:
-            range_multiplier = 0.5
-
+        ratio_1, ratio_2 = 0.382, 0.618
         start = par - ratio_1 * rng * range_multiplier
         end = par + ratio_2 * rng * range_multiplier
 
         if abs(end - start) < threshold:
             return par, float('inf')
 
-        c = end - (end - start) / 1.618
-        d = start + (end - start) / 1.618
-
         def evaluate_at(point):
             linear_par[i] = point
             matrix = metric_component.to_matrix_blocked(linear_par)
             return metric_component.compute_metric(ref_sup_2D, flt_sup, matrix, eref)
 
+        # Anchor metric at the seed — used as the anti-drift baseline.
+        baseline_mi = evaluate_at(par)
+
+        c = end - ratio_2 * (end - start)
+        d = start + ratio_2 * (end - start)
         mi_c = evaluate_at(c)
         mi_d = evaluate_at(d)
 
-        best_param = c if mi_c < mi_d else d
-        best_metric = min(mi_c, mi_d)
-
-        no_improvement = 0
-        last_best = best_metric
         it = 0
+        stuck_iters = 0
+        best_historic_mi = baseline_mi
 
-        while abs(c - d) > threshold and it < max_it:
+        while abs(end - start) > threshold and it < max_it:
+            current_iter_min = min(mi_c, mi_d)
+
+            if current_iter_min < best_historic_mi - metric_tol:
+                best_historic_mi = current_iter_min
+                stuck_iters = 0
+            else:
+                stuck_iters += 1
+
+            if stuck_iters >= flat_patience_limit:
+                break
+
             if mi_c < mi_d:
                 end, d, mi_d = d, c, mi_c
-                c = end - (end - start) / 1.618
+                c = end - ratio_2 * (end - start)
                 mi_c = evaluate_at(c)
             else:
                 start, c, mi_c = c, d, mi_d
-                d = start + (end - start) / 1.618
+                d = start + ratio_2 * (end - start)
                 mi_d = evaluate_at(d)
 
-            current_best = min(mi_c, mi_d)
-            current_best_param = c if mi_c < mi_d else d
-
-            if current_best < best_metric:
-                best_metric = current_best
-                best_param = current_best_param
-                no_improvement = 0
-            else:
-                no_improvement += 1
-
-            # Patience-based early stop
-            if no_improvement >= 5:
-                break
-            # Auto-relax threshold if the best stopped moving
-            if abs(last_best - best_metric) < threshold * 0.1:
-                threshold *= 1.5
-
-            last_best = best_metric
             it += 1
 
-        linear_par[i] = best_param
-        # NOTE: return best_metric (NOT negated). compute_metric is already a
-        # "lower-is-better" cost (exp(-MI)); the historical negation flipped the
-        # optimization direction and made Powell record the worst alignment as
-        # "best_params", producing final RMSE > initial RMSE.
-        return best_param, best_metric
+        final_best_mi = min(mi_c, mi_d)
+        final_best_param = c if mi_c < mi_d else d
+
+        # Anti-drift: only commit the new parameter if it strictly beats the
+        # value seen at the seed. Otherwise restore the seed to avoid drift
+        # on noisy plateaus.
+        if final_best_mi < baseline_mi:
+            linear_par[i] = final_best_param
+            return final_best_param, final_best_mi
+        linear_par[i] = par
+        return par, baseline_mi
 
     def register_images(self, Ref_uint8, Flt_uint8, metric_component):
         return self.register_images_adaptive(Ref_uint8, Flt_uint8, metric_component)
