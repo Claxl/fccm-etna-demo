@@ -210,8 +210,15 @@ with st.sidebar:
 
     st.markdown("---")
     with st.expander("Replay a recording"):
-        replay_file = st.text_input("JSONL path", placeholder="runs/CS01.jsonl",
+        replay_file = st.text_input("JSONL path A", placeholder="runs/CS01.jsonl",
                                     key="replay_file_input")
+        replay_file_b = st.text_input(
+            "JSONL path B (optional, for comparison)",
+            placeholder="runs/CS01_cpu.jsonl",
+            key="replay_file_b_input",
+            help="When set, both recordings are replayed in parallel and "
+                 "compared side-by-side.",
+        )
         replay_speed = st.slider("Speed", 0.25, 8.0, 1.0, step=0.25,
                                  key="replay_speed_slider")
         replay_levels = st.number_input("Pyramid levels in recording", 1, 8, 4,
@@ -381,7 +388,9 @@ render_kpi(qac_slot, "QAC", "—")
 # Run ETNA and stream events
 # ---------------------------------------------------------------------------
 
-def _run_and_stream(compare: bool = False, replay_path: str | None = None):
+def _run_and_stream(compare: bool = False,
+                    replay_path: str | None = None,
+                    replay_path_b: str | None = None):
     """Spawn ETNA + aggregator threads and render the live UI from snapshots.
 
     The optimizer runs in its own thread; an ``Aggregator`` daemon drains the
@@ -466,11 +475,45 @@ def _run_and_stream(compare: bool = False, replay_path: str | None = None):
             record_path=_record_path,
         )
 
-    # Optional parallel CPU comparison run (only when FPGA is selected).
+    # Optional parallel comparison run. Two flavours:
+    #   • Live FPGA + CPU side-by-side (compare=True, FPGA selected, no replay).
+    #   • Replay A vs Replay B (replay_path AND replay_path_b are set).
+    # Both share the same secondary KPI row machinery — only the label changes.
     cpu_thread = cpu_aggregator = cpu_slot = None
     cpu_kpi: dict = {}
-    if compare and device == "FPGA" and not replay_path:
+    cmp_label_main = "Run A"
+    cmp_label_other = "Run B"
+    if replay_path and replay_path_b:
+        cmp_label_main = Path(replay_path).stem
+        cmp_label_other = Path(replay_path_b).stem
         cpu_q: queue.Queue = queue.Queue()
+        cpu_thread, cpu_aggregator, cpu_slot = run_replay_async(
+            replay_path_b,
+            num_pyramid_levels=int(replay_levels),
+            speed=float(replay_speed),
+            event_queue=cpu_q,
+        )
+        st.markdown(f"##### Replay comparison — {cmp_label_main} vs {cmp_label_other}")
+        _cpu_cols = st.columns(8)
+        cpu_kpi["backend"] = _cpu_cols[0].empty()
+        cpu_kpi["level"]   = _cpu_cols[1].empty()
+        cpu_kpi["eval"]    = _cpu_cols[2].empty()
+        cpu_kpi["time"]    = _cpu_cols[3].empty()
+        cpu_kpi["rate"]    = _cpu_cols[4].empty()
+        cpu_kpi["rmse"]    = _cpu_cols[5].empty()
+        cpu_kpi["power"]   = _cpu_cols[6].empty()
+        cpu_kpi["qac"]     = _cpu_cols[7].empty()
+        render_kpi(cpu_kpi["backend"], f"{cmp_label_other} Backend", "—", "#3498db")
+        render_kpi(cpu_kpi["level"],   f"{cmp_label_other} Level",   "—")
+        render_kpi(cpu_kpi["eval"],    f"{cmp_label_other} Evals",   "0")
+        render_kpi(cpu_kpi["time"],    f"{cmp_label_other} Elapsed", "—")
+        render_kpi(cpu_kpi["rate"],    f"{cmp_label_other} ms/step", "—")
+        render_kpi(cpu_kpi["rmse"],    f"{cmp_label_other} RMSE",    "—")
+        render_kpi(cpu_kpi["power"],   f"{cmp_label_other} Power (W)", "—")
+        render_kpi(cpu_kpi["qac"],     f"{cmp_label_other} QAC",     "—")
+    elif compare and device == "FPGA" and not replay_path:
+        cmp_label_other = "CPU"
+        cpu_q = queue.Queue()
         cpu_thread, cpu_aggregator, cpu_slot = run_etna_async(
             fixed_img, moving_img,
             device="cpu",
@@ -668,33 +711,40 @@ def _run_and_stream(compare: bool = False, replay_path: str | None = None):
         if snap.qac is not None:
             render_kpi(qac_slot, "QAC", f"{snap.qac:.3f}")
 
-        # CPU comparison KPI update.
+        # Secondary stream KPI update (CPU comparison or replay-B).
         if cpu_aggregator is not None:
             cpu_snap = cpu_aggregator.get_snapshot()
-            # Freeze the CPU elapsed display once the CPU run has finished
-            # (so a still-running FPGA does not keep ticking the CPU timer).
+            # Freeze the secondary elapsed display once that run has finished
+            # so a still-running primary does not keep ticking its timer.
             if cpu_snap.done and "cpu_total_time" not in cpu_kpi:
                 cpu_kpi["cpu_total_time"] = time.time() - run_start
             cpu_elapsed = cpu_kpi.get("cpu_total_time", time.time() - run_start)
-            render_kpi(cpu_kpi["eval"],  "CPU Evals",   str(cpu_snap.total_evals))
-            render_kpi(cpu_kpi["time"],  "CPU Elapsed", f"{cpu_elapsed:.1f} s")
+            if cpu_snap.backend:
+                render_kpi(cpu_kpi["backend"], f"{cmp_label_other} Backend",
+                           cpu_snap.backend,
+                           "#27ae60" if cpu_snap.fpga_active else "#3498db")
+            render_kpi(cpu_kpi["eval"],  f"{cmp_label_other} Evals",
+                       str(cpu_snap.total_evals))
+            render_kpi(cpu_kpi["time"],  f"{cmp_label_other} Elapsed",
+                       f"{cpu_elapsed:.1f} s")
             if cpu_snap.last_step_ms is not None:
-                render_kpi(cpu_kpi["rate"], "CPU ms/step",
+                render_kpi(cpu_kpi["rate"], f"{cmp_label_other} ms/step",
                            f"{cpu_snap.last_step_ms:.1f}")
             if cpu_snap.active_level >= 0:
-                render_kpi(cpu_kpi["level"], "CPU Level",
+                render_kpi(cpu_kpi["level"], f"{cmp_label_other} Level",
                            f"L{cpu_snap.active_level}")
             if cpu_snap.initial_rmse is not None and cpu_snap.best_rmse != float("inf"):
                 delta_col = ("#27ae60" if cpu_snap.best_rmse < cpu_snap.initial_rmse
                              else "#e74c3c")
-                render_kpi(cpu_kpi["rmse"], "CPU RMSE",
+                render_kpi(cpu_kpi["rmse"], f"{cmp_label_other} RMSE",
                            f"{cpu_snap.initial_rmse:.1f}→{cpu_snap.best_rmse:.2f}",
                            delta_col)
             if cpu_snap.current_power_w is not None:
-                render_kpi(cpu_kpi["power"], "CPU Power (W)",
+                render_kpi(cpu_kpi["power"], f"{cmp_label_other} Power (W)",
                            f"{cpu_snap.current_power_w / 1_000_000:.2f}")
             if cpu_snap.qac is not None:
-                render_kpi(cpu_kpi["qac"], "CPU QAC", f"{cpu_snap.qac:.3f}")
+                render_kpi(cpu_kpi["qac"], f"{cmp_label_other} QAC",
+                           f"{cpu_snap.qac:.3f}")
 
         # Done when main run finished AND cpu run finished (if any).
         main_done = snap.done and not thread.is_alive()
@@ -756,7 +806,8 @@ def _run_and_stream(compare: bool = False, replay_path: str | None = None):
 
 
 if replay_clicked and replay_file:
-    _run_and_stream(replay_path=replay_file)
+    _run_and_stream(replay_path=replay_file,
+                    replay_path_b=replay_file_b or None)
 elif run_clicked:
     result = _run_and_stream(compare=compare_mode)
 
