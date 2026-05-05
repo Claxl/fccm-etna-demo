@@ -349,7 +349,7 @@ _init_fig.update_layout(
     xaxis_title="metric eval #", yaxis_title="similarity value",
     showlegend=True, legend=dict(orientation="h", y=-0.2),
 )
-curve_slot.plotly_chart(_init_fig, width="stretch", key="curve-init")
+curve_slot.plotly_chart(_init_fig, width="stretch")
 
 _init_rmse = go.Figure()
 _init_rmse.update_layout(
@@ -363,7 +363,7 @@ if gt_path is None:
         xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False,
         font=dict(color="#888"),
     )
-rmse_slot.plotly_chart(_init_rmse, width="stretch", key="rmse-init")
+rmse_slot.plotly_chart(_init_rmse, width="stretch")
 
 render_kpi(backend_slot, "Backend",
            "FPGA" if (device == "FPGA" and fpga_probe_active) else ("CPU" if device == "CPU" else "CPU fallback"),
@@ -588,8 +588,7 @@ def _run_and_stream(compare: bool = False, replay_path: str | None = None):
                 xaxis_title="metric eval #", yaxis_title="similarity value",
                 showlegend=True, legend=dict(orientation="h", y=-0.2),
             )
-            curve_slot.plotly_chart(fig, width="stretch",
-                                    key="live-mi-curve")
+            curve_slot.plotly_chart(fig, width="stretch")
 
         # RMSE curve — rebuild only if the rmse series grew.
         rmse_changed = any(
@@ -631,8 +630,7 @@ def _run_and_stream(compare: bool = False, replay_path: str | None = None):
                 xaxis_title="metric eval #", yaxis_title="RMSE (px)",
                 showlegend=True, legend=dict(orientation="h", y=-0.2),
             )
-            rmse_slot.plotly_chart(rmse_fig, width="stretch",
-                                   key="live-rmse-curve")
+            rmse_slot.plotly_chart(rmse_fig, width="stretch")
 
         if snap.last_transform is not None:
             matrix_slot.markdown(
