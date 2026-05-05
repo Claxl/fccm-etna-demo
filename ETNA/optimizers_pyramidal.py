@@ -535,10 +535,13 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
                     f"({max_level_seconds:.0f}s) reached after {it} sweeps.")
                 break
 
-            # Lock rotation at the finest level when a coarser level already
-            # found it (multi-level pyramid only).  With a single level there
-            # is no coarser pass, so theta must remain free.
-            if level == 0 and max_level > 1:
+            # Lock theta at L0 ONLY for FPGA runs: saves ~30% evaluations on the
+            # accelerator path. For CPU the extra theta sweeps are cheap and
+            # the residual rotation from L1 can still be ~0.002 rad which
+            # projects to ~0.5 px at 512 px scale — enough to lose sub-pixel
+            # accuracy. Single-level runs always keep theta free (max_level==1).
+            fpga_run = getattr(metric_component, 'use_fpga', False)
+            if level == 0 and max_level > 1 and fpga_run:
                 param_order = [0, 1]
             else:
                 param_order = [0, 1, 2]
