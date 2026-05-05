@@ -103,23 +103,47 @@ class FaberFPGAAccelerator:
             except RuntimeError:
                 asyncio.set_event_loop(asyncio.new_event_loop())
 
+            # On Kria, dfx-mgr / xmutil keeps the previously-loaded app firmware
+            # locked. Calling `xmutil unloadapp` releases the device so we can
+            # program our overlay without ETXTBSY. Best-effort: ignore errors
+            # if xmutil is not installed or there is nothing to unload.
+            import subprocess
+            try:
+                subprocess.run(
+                    ["xmutil", "unloadapp"],
+                    check=False, capture_output=True, timeout=5,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
             # ETXTBSY (errno 26 "Text file busy") happens when another process
-            # is still loading the bitstream. Retry a few times with backoff
-            # before giving up so a previous Streamlit instance has time to
-            # release the FPGA.
+            # is still holding the bitstream. Retry up to 6 times with
+            # exponential backoff (~31s total) before giving up.
             print(f"Loading FPGA Overlay: {overlay_path}...")
             _attempts = 0
+            _max_attempts = 6
             while True:
                 try:
                     self.overlay = Overlay(overlay_path)
                     break
                 except OSError as oe:
-                    if oe.errno != 26 or _attempts >= 3:
+                    if oe.errno != 26 or _attempts >= _max_attempts:
+                        if oe.errno == 26:
+                            # Final actionable hint for the user.
+                            raise OSError(
+                                oe.errno,
+                                f"{oe.strerror} after {_max_attempts} retries. "
+                                "Another process is holding the FPGA. Try:\n"
+                                "  1) sudo xmutil unloadapp\n"
+                                "  2) sudo lsof " + overlay_path + "  # find the holder\n"
+                                "  3) sudo pkill -9 streamlit python  # kill stale sessions\n"
+                                "  4) reboot the Kria as last resort"
+                            ) from oe
                         raise
                     _attempts += 1
                     backoff = 0.5 * (2 ** _attempts)
-                    print("WARNING: Overlay load got ETXTBSY (Text file busy), retry "
-                        "%d in %.1fs..." % (_attempts, backoff,))
+                    print("WARNING: Overlay load got ETXTBSY, retry %d/%d in %.1fs..."
+                          % (_attempts, _max_attempts, backoff))
                     time.sleep(backoff)
 
             # Resolve the accelerator IP block by known name or by substring.
