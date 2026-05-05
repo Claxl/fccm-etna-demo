@@ -494,6 +494,13 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
 
         rand_gen = np.random.RandomState(420)
 
+        # Patience-based early stop: hand control to the next pyramid level
+        # when best_metric stops improving by more than `eps` across
+        # `patience` consecutive sweeps (local-minimum detection).
+        patience = max(3, max_iterations // 10)
+        stuck_sweeps = 0
+        last_best_metric = best_metric
+
         while not converged and it < max_iterations:
             converged = True
             it += 1
@@ -525,6 +532,18 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
                         best_params = par_lin.clone()
                 else:
                     par_lin[param_idx] = cur_par
+
+            if best_metric < last_best_metric - eps:
+                last_best_metric = best_metric
+                stuck_sweeps = 0
+            else:
+                stuck_sweeps += 1
+            if stuck_sweeps >= patience:
+                logger.info(
+                    f"[Powell] Level {level}: stuck at local min for "
+                    f"{stuck_sweeps} sweeps, advancing to next pyramid level."
+                )
+                break
 
         return best_params
 
@@ -605,7 +624,11 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
             it += 1
 
         linear_par[i] = best_param
-        return best_param, -best_metric
+        # NOTE: return best_metric (NOT negated). compute_metric is already a
+        # "lower-is-better" cost (exp(-MI)); the historical negation flipped the
+        # optimization direction and made Powell record the worst alignment as
+        # "best_params", producing final RMSE > initial RMSE.
+        return best_param, best_metric
 
     def register_images(self, Ref_uint8, Flt_uint8, metric_component):
         return self.register_images_adaptive(Ref_uint8, Flt_uint8, metric_component)
