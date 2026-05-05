@@ -27,6 +27,7 @@ from etna_runner import (  # noqa: E402
     StatusEvent,
     detect_fpga_status,
     run_etna_async,
+    run_replay_async,
 )
 from visualization import (  # noqa: E402
     annotate,
@@ -191,11 +192,31 @@ with st.sidebar:
         help="Coarse-to-fine resolution levels (1 = single-level, no pyramid).",
     )
 
+    compare_mode = (
+        st.checkbox("Compare CPU vs FPGA",
+                    help="Run CPU and FPGA in parallel to show the speed advantage")
+        if device == "FPGA" else False
+    )
+
+    record_run = st.checkbox("Record run to file",
+                             help="Save events to runs/<pair>.jsonl for offline replay")
+
     run_clicked = st.button("Run ETNA", type="primary", width="stretch",
                             disabled=pair_name is None)
     reset_clicked = st.button("Reset", width="stretch")
 
     st.markdown("---")
+    with st.expander("Replay a recording"):
+        replay_file = st.text_input("JSONL path", placeholder="runs/CS01.jsonl",
+                                    key="replay_file_input")
+        replay_speed = st.slider("Speed", 0.25, 8.0, 1.0, step=0.25,
+                                 key="replay_speed_slider")
+        replay_levels = st.number_input("Pyramid levels in recording", 1, 8, 4,
+                                        key="replay_levels_input")
+        replay_clicked = st.button("Replay", width="stretch",
+                                   disabled=not replay_file,
+                                   key="replay_btn")
+
     fpga_probe_active, fpga_probe_msg = detect_fpga_status(device == "FPGA")
     if device == "FPGA":
         badge_cls = "badge-ok" if fpga_probe_active else "badge-warn"
@@ -357,13 +378,19 @@ render_kpi(qac_slot, "QAC", "—")
 # Run ETNA and stream events
 # ---------------------------------------------------------------------------
 
-def _run_and_stream():
+def _run_and_stream(compare: bool = False, replay_path: str | None = None):
     """Spawn ETNA + aggregator threads and render the live UI from snapshots.
 
     The optimizer runs in its own thread; an ``Aggregator`` daemon drains the
     event queue into a ``LiveSnapshot``; this main thread only polls the
     snapshot at ~10 fps and re-renders when ``snapshot.version`` changes.
     UI back-pressure no longer affects the optimizer.
+
+    When ``compare=True`` (FPGA selected), a second CPU run starts in parallel
+    and a comparison KPI row is shown below the main row.
+
+    When ``replay_path`` is set, events are sourced from a JSONL recording
+    instead of running ETNA.
     """
     overlay_refresh_every = 6  # update fused overlay every Nth evaluation
     run_start = time.time()
@@ -409,17 +436,66 @@ def _run_and_stream():
         pass
 
     event_q: queue.Queue = queue.Queue()
-    thread, aggregator, slot = run_etna_async(
-        fixed_img, moving_img,
-        device="fpga" if device == "FPGA" else "cpu",
-        metric=metric, optimizer=optimizer, ref_size=ref_size,
-        event_queue=event_q,
-        gt_mat_path=str(gt_path) if gt_path is not None else None,
-        num_pyramid_levels=num_levels,
-    )
+
+    # Derive record path from pair name when recording is enabled.
+    _record_path: str | None = None
+    if record_run and pair_name:
+        import os as _os
+        _os.makedirs("runs", exist_ok=True)
+        _record_path = f"runs/{pair_name}.jsonl"
+
+    if replay_path:
+        # Replay mode: source events from a JSONL recording.
+        thread, aggregator, slot = run_replay_async(
+            replay_path,
+            num_pyramid_levels=int(replay_levels),
+            speed=float(replay_speed),
+            event_queue=event_q,
+        )
+    else:
+        thread, aggregator, slot = run_etna_async(
+            fixed_img, moving_img,
+            device="fpga" if device == "FPGA" else "cpu",
+            metric=metric, optimizer=optimizer, ref_size=ref_size,
+            event_queue=event_q,
+            gt_mat_path=str(gt_path) if gt_path is not None else None,
+            num_pyramid_levels=num_levels,
+            record_path=_record_path,
+        )
+
+    # Optional parallel CPU comparison run (only when FPGA is selected).
+    cpu_thread = cpu_aggregator = cpu_slot = None
+    cpu_kpi: dict = {}
+    if compare and device == "FPGA" and not replay_path:
+        cpu_q: queue.Queue = queue.Queue()
+        cpu_thread, cpu_aggregator, cpu_slot = run_etna_async(
+            fixed_img, moving_img,
+            device="cpu",
+            metric=metric, optimizer=optimizer, ref_size=ref_size,
+            event_queue=cpu_q,
+            gt_mat_path=str(gt_path) if gt_path is not None else None,
+            num_pyramid_levels=num_levels,
+        )
+        st.markdown("##### FPGA vs CPU live comparison")
+        _cpu_cols = st.columns(6)
+        cpu_kpi["backend"] = _cpu_cols[0].empty()
+        cpu_kpi["level"]   = _cpu_cols[1].empty()
+        cpu_kpi["eval"]    = _cpu_cols[2].empty()
+        cpu_kpi["rate"]    = _cpu_cols[3].empty()
+        cpu_kpi["rmse"]    = _cpu_cols[4].empty()
+        cpu_kpi["time"]    = _cpu_cols[5].empty()
+        render_kpi(cpu_kpi["backend"], "CPU Backend", "CPU", "#3498db")
+        render_kpi(cpu_kpi["level"],   "CPU Level",   "—")
+        render_kpi(cpu_kpi["eval"],    "CPU Evals",   "0")
+        render_kpi(cpu_kpi["rate"],    "CPU ms/step", "—")
+        render_kpi(cpu_kpi["rmse"],    "CPU RMSE",    "—")
+        render_kpi(cpu_kpi["time"],    "CPU Elapsed", "—")
 
     status_msg = st.empty()
-    status_msg.info("Launching ETNA…")
+    if replay_path:
+        status_msg.info(f"Replaying {Path(replay_path).name} …")
+    else:
+        status_msg.info("Launching ETNA…")
 
     # Snapshot polling loop. We only re-render when the aggregator bumps its
     # version counter; this keeps the browser idle when ETNA is between
@@ -581,10 +657,39 @@ def _run_and_stream():
         if snap.qac is not None:
             render_kpi(qac_slot, "QAC", f"{snap.qac:.3f}")
 
-        if snap.done and not thread.is_alive():
+        # CPU comparison KPI update.
+        if cpu_aggregator is not None:
+            cpu_snap = cpu_aggregator.get_snapshot()
+            cpu_elapsed = time.time() - run_start
+            render_kpi(cpu_kpi["eval"],  "CPU Evals",   str(cpu_snap.total_evals))
+            render_kpi(cpu_kpi["time"],  "CPU Elapsed", f"{cpu_elapsed:.1f} s")
+            if cpu_snap.last_step_ms is not None:
+                render_kpi(cpu_kpi["rate"], "CPU ms/step",
+                           f"{cpu_snap.last_step_ms:.1f}")
+            if cpu_snap.active_level >= 0:
+                render_kpi(cpu_kpi["level"], "CPU Level",
+                           f"L{cpu_snap.active_level}")
+            if cpu_snap.initial_rmse is not None and cpu_snap.best_rmse != float("inf"):
+                delta_col = ("#27ae60" if cpu_snap.best_rmse < cpu_snap.initial_rmse
+                             else "#e74c3c")
+                render_kpi(cpu_kpi["rmse"], "CPU RMSE",
+                           f"{cpu_snap.initial_rmse:.1f}→{cpu_snap.best_rmse:.2f}",
+                           delta_col)
+
+        # Done when main run finished AND cpu run finished (if any).
+        main_done = snap.done and not thread.is_alive()
+        cpu_done = (
+            cpu_aggregator is None
+            or (cpu_aggregator.get_snapshot().done and not cpu_thread.is_alive())
+        )
+        if main_done and cpu_done:
             break
 
     thread.join(timeout=2.0)
+    if cpu_thread is not None:
+        cpu_thread.join(timeout=2.0)
+    if cpu_aggregator is not None:
+        cpu_aggregator.stop()
     aggregator.stop()
     final_snap = aggregator.get_snapshot()
 
@@ -611,14 +716,30 @@ def _run_and_stream():
     if "selected_layer" not in st.session_state:
         st.session_state.selected_layer = 0
 
+    # Record path notification.
+    if _record_path:
+        st.info(f"Run recorded to `{_record_path}`")
+
     if "error" in slot:
         st.error(f"Run failed: {slot['error']}")
         return None
+
+    # Cache CPU comparison result so the speedup banner fires automatically.
+    if cpu_slot is not None and "result" in cpu_slot and cpu_slot["result"] is not None:
+        cpu_res = cpu_slot["result"]
+        st.session_state.runs.setdefault(pair_name, {})[cpu_res.backend] = {
+            "total_time": cpu_res.total_time,
+            "eval_count": cpu_res.eval_count,
+        }
+
     return slot.get("result")
 
 
+if replay_clicked and replay_file:
+    _run_and_stream(replay_path=replay_file)
+
 if run_clicked:
-    result = _run_and_stream()
+    result = _run_and_stream(compare=compare_mode)
 
     if result is not None:
         # Cache this run for later CPU-vs-FPGA speedup comparison.
