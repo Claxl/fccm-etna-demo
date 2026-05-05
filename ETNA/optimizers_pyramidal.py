@@ -514,19 +514,14 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         matrix = metric_component.to_matrix_blocked(par_lin)
         best_metric = metric_component.compute_metric(ref_sup_2D, flt_sup, matrix, eref)
 
-        # Per-level budget. Coarse levels (L2/L3) only need to give a rough
-        # seed to L1 — running 10 Powell sweeps on a 32x32 image was burning
-        # ~12 s on FPGA without measurable accuracy gain, since the MI is
-        # already saturated after a few sweeps at that resolution. The fine
-        # levels (L0/L1) keep their original budget.
+        # Per-level budget. Coarser levels deserve more iterations because
+        # they explore the parameter space; the finest level just refines.
         if level == 0:
-            patience, eps, min_sweeps, max_iterations = 1, 0.001,   1, 3
+            patience, eps, min_sweeps, max_iterations = 1, 0.001,  1, 3
         elif level == 1:
-            patience, eps, min_sweeps, max_iterations = 2, 0.001,   2, 5
-        elif level == 2:
-            patience, eps, min_sweeps, max_iterations = 2, 0.0005,  2, 6
+            patience, eps, min_sweeps, max_iterations = 2, 0.001,  2, 6
         else:
-            patience, eps, min_sweeps, max_iterations = 2, 0.0005,  2, 5
+            patience, eps, min_sweeps, max_iterations = 3, 0.0005, 2, 10
 
         if max_iterations_override is not None:
             max_iterations = max_iterations_override
