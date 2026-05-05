@@ -202,10 +202,21 @@ class FaberFPGAAccelerator:
 
         # 3) Marshal the 2x3 affine transform into a 3x3 homogeneous matrix
         #    and store it in the uncached DMA buffer.
+        #
+        # IMPORTANT: kornia.warp_affine (used in the SW path) interprets the
+        # matrix as INVERSE mapping (output -> input pixel), while Xilinx
+        # xf::cv::warpTransform with TRANSFORM_TYPE=AFFINE uses FORWARD
+        # mapping (input -> output pixel). Sending the same matrix would
+        # apply opposite warps and the optimizer would converge to garbage.
+        # Invert the affine here so the FPGA produces the same warped image
+        # as the SW reference for any given M.
+        import cv2
         if isinstance(transform_matrix_2x3, torch.Tensor):
-            t_mat = transform_matrix_2x3.detach().cpu().numpy()
+            t_mat_2x3 = transform_matrix_2x3.detach().cpu().numpy()
         else:
-            t_mat = transform_matrix_2x3
+            t_mat_2x3 = transform_matrix_2x3
+        t_mat_2x3 = np.asarray(t_mat_2x3[:2, :], dtype=np.float32)
+        t_mat = cv2.invertAffineTransform(t_mat_2x3)
 
         self.transform_buffer[0] = t_mat[0, 0]
         self.transform_buffer[1] = t_mat[0, 1]
