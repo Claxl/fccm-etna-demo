@@ -354,25 +354,27 @@ render_kpi(rmse_kpi_slot, "RMSE (px)", "— / —")
 # ---------------------------------------------------------------------------
 
 def _run_and_stream():
-    # Per-level bookkeeping fed by the event stream.
-    series: dict[int, list[tuple[int, float]]] = {i: [] for i in range(num_levels)}
-    rmse_series: dict[int, list[tuple[int, float]]] = {i: [] for i in range(num_levels)}
-    level_timings: dict[int, float] = {}
-    level_start_time: dict[int, float] = {}
-    active_level = -1
-    last_transform = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
-    ui_last_refresh = 0.0
+    """Spawn ETNA + aggregator threads and render the live UI from snapshots.
+
+    The optimizer runs in its own thread; an ``Aggregator`` daemon drains the
+    event queue into a ``LiveSnapshot``; this main thread only polls the
+    snapshot at ~10 fps and re-renders when ``snapshot.version`` changes.
+    UI back-pressure no longer affects the optimizer.
+    """
     overlay_refresh_every = 6  # update fused overlay every Nth evaluation
-    total_evals = 0
     run_start = time.time()
-    initial_rmse: float | None = None
-    best_rmse: float = float("inf")
+    last_seen_version = -1
+    last_overlay_eval = -1
+    last_overlay_transform: np.ndarray | None = None
+    last_status_seen = 0
+    seen_curve_len: dict[int, int] = {}
+    seen_rmse_len: dict[int, int] = {}
 
     # Per-level snapshot persisted in session state so the post-run clickable
-    # ladder can drill into any level even after Streamlit reruns.
-    per_level: dict[int, dict] = {}
-    for i in range(num_levels):
-        per_level[i] = {
+    # ladder can drill into any level even after Streamlit reruns. We fill the
+    # series/wall_time fields from the aggregator snapshot at the end.
+    per_level: dict[int, dict] = {
+        i: {
             "size": 0,
             "series": [],
             "rmse_series": [],
@@ -381,6 +383,8 @@ def _run_and_stream():
             "ref_img": None,
             "moving_img": None,
         }
+        for i in range(num_levels)
+    }
 
     # Pre-build the ref/moving pyramid so the detail panel has the downsampled
     # images ready (the optimizer builds its own internally with the same
@@ -398,11 +402,10 @@ def _run_and_stream():
             per_level[i]["moving_img"] = mov_np
             per_level[i]["size"] = int(ref_np.shape[-1])
     except Exception:
-        # Non-fatal — the detail panel simply won't show previews.
         pass
 
     event_q: queue.Queue = queue.Queue()
-    thread, slot = run_etna_async(
+    thread, aggregator, slot = run_etna_async(
         fixed_img, moving_img,
         device="fpga" if device == "FPGA" else "cpu",
         metric=metric, optimizer=optimizer, ref_size=ref_size,
@@ -414,179 +417,182 @@ def _run_and_stream():
     status_msg = st.empty()
     status_msg.info("Launching ETNA…")
 
-    while thread.is_alive() or not event_q.empty():
-        try:
-            evt = event_q.get(timeout=0.1)
-        except queue.Empty:
-            continue
+    # Snapshot polling loop. We only re-render when the aggregator bumps its
+    # version counter; this keeps the browser idle when ETNA is between
+    # bursts of metric evaluations.
+    while True:
+        snap = aggregator.get_snapshot()
 
-        now = time.time()
-
-        if isinstance(evt, StatusEvent):
+        # Drain new status messages once per poll, regardless of version drift.
+        while last_status_seen < len(snap.status_messages):
+            evt = snap.status_messages[last_status_seen]
+            last_status_seen += 1
             if evt.severity == "warning":
                 status_msg.warning(evt.message)
             elif evt.severity == "error":
                 status_msg.error(evt.message)
             elif evt.severity == "done":
-                status_msg.success(f"Done in {evt.payload.get('total_time', 0):.2f}s — "
-                                   f"{evt.payload.get('eval_count', 0)} metric evaluations")
-                if "backend" in evt.payload:
-                    render_kpi(
-                        backend_slot, "Backend", evt.payload["backend"],
-                        "#27ae60" if evt.payload.get("fpga_active") else "#3498db",
-                    )
-                final_rmse = evt.payload.get("final_rmse_px")
-                if initial_rmse is not None and final_rmse is not None:
-                    render_kpi(
-                        rmse_kpi_slot, "RMSE (px)",
-                        f"{initial_rmse:.1f} → {final_rmse:.2f}",
-                        "#27ae60" if final_rmse < initial_rmse else "#e74c3c",
-                    )
+                status_msg.success(
+                    f"Done in {evt.payload.get('total_time', 0):.2f}s — "
+                    f"{evt.payload.get('eval_count', 0)} metric evaluations"
+                )
             else:
                 status_msg.info(evt.message)
-                if "backend" in evt.payload:
-                    render_kpi(
-                        backend_slot, "Backend", evt.payload["backend"],
-                        "#27ae60" if evt.payload.get("fpga_active") else "#3498db",
-                    )
-                if "initial_rmse_px" in evt.payload:
-                    initial_rmse = float(evt.payload["initial_rmse_px"])
-                    render_kpi(rmse_kpi_slot, "RMSE (px)",
-                               f"{initial_rmse:.1f} → …", "#f39c12")
 
-        elif isinstance(evt, LevelEvent):
-            if evt.phase == "start":
-                # Close previous level timing and snapshot its final transform.
-                if active_level >= 0 and active_level in level_start_time:
-                    elapsed = now - level_start_time[active_level]
-                    level_timings[active_level] = elapsed
-                    if active_level in per_level:
-                        per_level[active_level]["wall_time"] = elapsed
-                        per_level[active_level]["final_transform"] = np.asarray(
-                            last_transform, dtype=np.float32
-                        ).copy()
-                active_level = max(0, min(num_levels - 1, evt.level))
-                level_start_time[active_level] = now
-                if active_level in per_level and evt.level_size:
-                    per_level[active_level]["size"] = int(evt.level_size)
-                ladder_slot.markdown(
-                    render_ladder(active_level, num_levels), unsafe_allow_html=True
-                )
-                render_kpi(level_slot, "Level", f"L{evt.level} @ {evt.level_size}px")
+        if snap.backend is not None:
+            render_kpi(
+                backend_slot, "Backend", snap.backend,
+                "#27ae60" if snap.fpga_active else "#3498db",
+            )
 
-        elif isinstance(evt, MetricEvent):
-            total_evals += 1
-            lvl = max(0, min(num_levels - 1, evt.level))
-            series[lvl].append((total_evals, evt.value))
-            per_level[lvl]["series"].append((total_evals, evt.value))
-            if evt.rmse_px is not None and not (evt.rmse_px != evt.rmse_px):  # NaN check
-                rmse_series[lvl].append((total_evals, float(evt.rmse_px)))
-                per_level[lvl]["rmse_series"].append((total_evals, float(evt.rmse_px)))
-                if evt.rmse_px < best_rmse:
-                    best_rmse = float(evt.rmse_px)
-            if evt.transform is not None:
-                last_transform = evt.transform
+        if snap.version == last_seen_version:
+            if snap.done or not (thread.is_alive() or aggregator.is_running()):
+                break
+            time.sleep(0.05)
+            continue
+        last_seen_version = snap.version
 
-            # Throttle UI refresh to ~10 fps to keep the browser happy.
-            if now - ui_last_refresh > 0.1:
-                ui_last_refresh = now
+        # Active level / ladder
+        if snap.active_level >= 0:
+            ladder_slot.markdown(
+                render_ladder(snap.active_level, num_levels),
+                unsafe_allow_html=True,
+            )
+            level_size_now = snap.level_size.get(snap.active_level, 0)
+            render_kpi(level_slot, "Level",
+                       f"L{snap.active_level} @ {level_size_now}px")
 
-                # Live overlay (expensive) — only every Nth eval.
-                if total_evals % overlay_refresh_every == 0:
-                    warped_live = warp_affine(moving_img, last_transform,
-                                              out_size=(ref_size, ref_size))
-                    overlay_slot.image(
-                        annotate(make_fusion(fixed_img, warped_live),
-                                 f"live overlay - L{lvl} | eval {total_evals}",
-                                 level_bgr(lvl)),
-                        channels="BGR", use_container_width=True,
-                    )
+        # Live overlay (expensive) — only on transform change, every Nth eval.
+        if (snap.last_transform is not None
+                and snap.total_evals - last_overlay_eval >= overlay_refresh_every
+                and (last_overlay_transform is None
+                     or not np.array_equal(snap.last_transform,
+                                           last_overlay_transform))):
+            warped_live = warp_affine(moving_img, snap.last_transform,
+                                      out_size=(ref_size, ref_size))
+            overlay_slot.image(
+                annotate(make_fusion(fixed_img, warped_live),
+                         f"live overlay - L{snap.active_level} | eval {snap.total_evals}",
+                         level_bgr(max(0, snap.active_level))),
+                channels="BGR", use_container_width=True,
+            )
+            last_overlay_eval = snap.total_evals
+            last_overlay_transform = snap.last_transform
 
-                # MI / metric curve
-                fig = go.Figure()
-                for idx, pts in series.items():
+        # Metric curve — rebuild only if any per-level series grew.
+        curve_changed = any(
+            len(snap.series.get(idx, [])) != seen_curve_len.get(idx, 0)
+            for idx in range(num_levels)
+        )
+        if curve_changed:
+            fig = go.Figure()
+            for idx in range(num_levels):
+                pts = snap.series.get(idx, [])
+                seen_curve_len[idx] = len(pts)
+                if not pts:
+                    continue
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                fig.add_trace(go.Scatter(
+                    x=xs, y=ys, mode="lines+markers",
+                    name=level_label(idx),
+                    line=dict(color=level_colour(idx), width=2),
+                    marker=dict(size=4),
+                ))
+            fig.update_layout(
+                template="plotly_dark", height=300,
+                margin=dict(l=10, r=10, t=20, b=30),
+                xaxis_title="metric eval #", yaxis_title="similarity value",
+                showlegend=True, legend=dict(orientation="h", y=-0.2),
+            )
+            curve_slot.plotly_chart(fig, use_container_width=True,
+                                    key=f"curve-{snap.total_evals}")
+
+        # RMSE curve — rebuild only if the rmse series grew.
+        rmse_changed = any(
+            len(snap.rmse_series.get(idx, [])) != seen_rmse_len.get(idx, 0)
+            for idx in range(num_levels)
+        )
+        if rmse_changed:
+            rmse_fig = go.Figure()
+            if any(snap.rmse_series.values()):
+                for idx in range(num_levels):
+                    pts = snap.rmse_series.get(idx, [])
+                    seen_rmse_len[idx] = len(pts)
                     if not pts:
                         continue
                     xs = [p[0] for p in pts]
                     ys = [p[1] for p in pts]
-                    fig.add_trace(go.Scatter(
+                    rmse_fig.add_trace(go.Scatter(
                         x=xs, y=ys, mode="lines+markers",
                         name=level_label(idx),
                         line=dict(color=level_colour(idx), width=2),
                         marker=dict(size=4),
                     ))
-                fig.update_layout(
-                    template="plotly_dark", height=300,
-                    margin=dict(l=10, r=10, t=20, b=30),
-                    xaxis_title="metric eval #", yaxis_title="similarity value",
-                    showlegend=True, legend=dict(orientation="h", y=-0.2),
-                )
-                curve_slot.plotly_chart(fig, use_container_width=True,
-                                        key=f"curve-{total_evals}")
-
-                # Landmark RMSE curve (ground truth).
-                rmse_fig = go.Figure()
-                if any(rmse_series.values()):
-                    for idx, pts in rmse_series.items():
-                        if not pts:
-                            continue
-                        xs = [p[0] for p in pts]
-                        ys = [p[1] for p in pts]
-                        rmse_fig.add_trace(go.Scatter(
-                            x=xs, y=ys, mode="lines+markers",
-                            name=level_label(idx),
-                            line=dict(color=level_colour(idx), width=2),
-                            marker=dict(size=4),
-                        ))
-                    if initial_rmse is not None:
-                        rmse_fig.add_hline(
-                            y=initial_rmse, line_dash="dash",
-                            line_color="#888",
-                            annotation_text=f"initial = {initial_rmse:.1f}px",
-                            annotation_position="top right",
-                        )
-                else:
-                    rmse_fig.add_annotation(
-                        text="no ground truth loaded for this pair",
-                        xref="paper", yref="paper", x=0.5, y=0.5,
-                        showarrow=False, font=dict(color="#888"),
+                if snap.initial_rmse is not None:
+                    rmse_fig.add_hline(
+                        y=snap.initial_rmse, line_dash="dash",
+                        line_color="#888",
+                        annotation_text=f"initial = {snap.initial_rmse:.1f}px",
+                        annotation_position="top right",
                     )
-                rmse_fig.update_layout(
-                    template="plotly_dark", height=300,
-                    margin=dict(l=10, r=10, t=20, b=30),
-                    xaxis_title="metric eval #", yaxis_title="RMSE (px)",
-                    showlegend=True, legend=dict(orientation="h", y=-0.2),
+            else:
+                rmse_fig.add_annotation(
+                    text="no ground truth loaded for this pair",
+                    xref="paper", yref="paper", x=0.5, y=0.5,
+                    showarrow=False, font=dict(color="#888"),
                 )
-                rmse_slot.plotly_chart(rmse_fig, use_container_width=True,
-                                       key=f"rmse-{total_evals}")
+            rmse_fig.update_layout(
+                template="plotly_dark", height=300,
+                margin=dict(l=10, r=10, t=20, b=30),
+                xaxis_title="metric eval #", yaxis_title="RMSE (px)",
+                showlegend=True, legend=dict(orientation="h", y=-0.2),
+            )
+            rmse_slot.plotly_chart(rmse_fig, use_container_width=True,
+                                   key=f"rmse-{snap.total_evals}")
 
-                # Transform matrix
-                matrix_slot.markdown(render_matrix(last_transform), unsafe_allow_html=True)
+        if snap.last_transform is not None:
+            matrix_slot.markdown(
+                render_matrix(snap.last_transform), unsafe_allow_html=True,
+            )
 
-                # KPIs
-                elapsed = now - run_start
-                render_kpi(eval_slot, "Metric evals", f"{total_evals}")
-                render_kpi(time_slot, "Elapsed", f"{elapsed:.2f} s")
-                render_kpi(rate_slot, "Evals / s",
-                           f"{total_evals / max(elapsed, 1e-3):.1f}")
-                if initial_rmse is not None and best_rmse != float("inf"):
-                    delta_colour = "#27ae60" if best_rmse < initial_rmse else "#e74c3c"
-                    render_kpi(rmse_kpi_slot, "RMSE (px)",
-                               f"{initial_rmse:.1f} → {best_rmse:.2f}",
-                               delta_colour)
+        elapsed = time.time() - run_start
+        render_kpi(eval_slot, "Metric evals", f"{snap.total_evals}")
+        render_kpi(time_slot, "Elapsed", f"{elapsed:.2f} s")
+        render_kpi(rate_slot, "Evals / s",
+                   f"{snap.total_evals / max(elapsed, 1e-3):.1f}")
+        if snap.initial_rmse is not None and snap.best_rmse != float("inf"):
+            delta_colour = ("#27ae60" if snap.best_rmse < snap.initial_rmse
+                            else "#e74c3c")
+            render_kpi(rmse_kpi_slot, "RMSE (px)",
+                       f"{snap.initial_rmse:.1f} → {snap.best_rmse:.2f}",
+                       delta_colour)
+        elif snap.initial_rmse is not None:
+            render_kpi(rmse_kpi_slot, "RMSE (px)",
+                       f"{snap.initial_rmse:.1f} → …", "#f39c12")
+
+        if snap.done and not thread.is_alive():
+            break
 
     thread.join(timeout=2.0)
+    aggregator.stop()
+    final_snap = aggregator.get_snapshot()
 
-    # Close out the last active level so the detail panel has a transform
-    # snapshot and wall-time for every level that actually ran.
-    if active_level >= 0 and active_level in level_start_time:
-        elapsed = time.time() - level_start_time[active_level]
-        level_timings[active_level] = elapsed
-        if active_level in per_level:
-            per_level[active_level]["wall_time"] = elapsed
-            per_level[active_level]["final_transform"] = np.asarray(
-                last_transform, dtype=np.float32
-            ).copy()
+    # Fold the aggregator's per-level series into the post-run drill-down
+    # snapshot the clickable ladder reads from.
+    last_transform_seen = final_snap.last_transform
+    for lvl in range(num_levels):
+        per_level[lvl]["series"] = list(final_snap.series.get(lvl, []))
+        per_level[lvl]["rmse_series"] = list(final_snap.rmse_series.get(lvl, []))
+        per_level[lvl]["wall_time"] = float(
+            final_snap.level_timings.get(lvl, 0.0)
+        )
+        if final_snap.level_size.get(lvl):
+            per_level[lvl]["size"] = int(final_snap.level_size[lvl])
+    if last_transform_seen is not None and final_snap.active_level >= 0:
+        per_level[final_snap.active_level]["final_transform"] = np.asarray(
+            last_transform_seen, dtype=np.float32
+        ).copy()
 
     # Persist per-level snapshot so the clickable ladder (rendered on the next
     # rerun after a button press) can pull from session_state.
