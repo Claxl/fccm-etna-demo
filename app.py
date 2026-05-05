@@ -192,13 +192,16 @@ with st.sidebar:
         help="Coarse-to-fine resolution levels (1 = single-level, no pyramid).",
     )
 
-    compare_mode = (
-        st.checkbox("Compare CPU vs FPGA",
-                    help="Run CPU and FPGA in parallel to show the speed advantage")
-        if device == "FPGA" else False
-    )
+    if device == "FPGA":
+        compare_mode = st.checkbox(
+            "⚡ Compare FPGA vs CPU (parallel)",
+            value=False,
+            help="Launches a second CPU run in parallel — side-by-side speed comparison",
+        )
+    else:
+        compare_mode = False
 
-    record_run = st.checkbox("Record run to file",
+    record_run = st.checkbox("💾 Record run to file",
                              help="Save events to runs/<pair>.jsonl for offline replay")
 
     run_clicked = st.button("Run ETNA", type="primary", width="stretch",
@@ -586,7 +589,7 @@ def _run_and_stream(compare: bool = False, replay_path: str | None = None):
                 showlegend=True, legend=dict(orientation="h", y=-0.2),
             )
             curve_slot.plotly_chart(fig, width="stretch",
-                                    key=f"curve-v{snap.version}")
+                                    key="live-mi-curve")
 
         # RMSE curve — rebuild only if the rmse series grew.
         rmse_changed = any(
@@ -629,7 +632,7 @@ def _run_and_stream(compare: bool = False, replay_path: str | None = None):
                 showlegend=True, legend=dict(orientation="h", y=-0.2),
             )
             rmse_slot.plotly_chart(rmse_fig, width="stretch",
-                                   key=f"rmse-v{snap.version}")
+                                   key="live-rmse-curve")
 
         if snap.last_transform is not None:
             matrix_slot.markdown(
@@ -737,8 +740,7 @@ def _run_and_stream(compare: bool = False, replay_path: str | None = None):
 
 if replay_clicked and replay_file:
     _run_and_stream(replay_path=replay_file)
-
-if run_clicked:
+elif run_clicked:
     result = _run_and_stream(compare=compare_mode)
 
     if result is not None:
