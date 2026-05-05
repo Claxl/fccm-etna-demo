@@ -265,6 +265,31 @@ class Aggregator:
                     snap.fpga_status_detail = payload["fpga_status_detail"]
                 if "initial_rmse_px" in payload and snap.initial_rmse is None:
                     snap.initial_rmse = float(payload["initial_rmse_px"])
+                # Final-summary fields emitted by the "done" / "summary"
+                # status events. We apply them at the end so partial replays
+                # still finish with correct dashboard tiles.
+                if evt.severity in ("done", "summary"):
+                    if "level" in payload and payload["level"] is not None:
+                        lvl = int(payload["level"])
+                        if lvl >= 0:
+                            snap.active_level = lvl
+                            if "level_size" in payload \
+                                    and payload["level_size"] is not None:
+                                snap.level_size[lvl] = int(payload["level_size"])
+                    if "total_evals" in payload \
+                            and payload["total_evals"] is not None:
+                        snap.total_evals = max(snap.total_evals,
+                                               int(payload["total_evals"]))
+                    if "ms_per_step_last" in payload \
+                            and payload["ms_per_step_last"] is not None:
+                        snap.last_step_ms = float(payload["ms_per_step_last"])
+                    if "final_rmse_px" in payload \
+                            and payload["final_rmse_px"] is not None:
+                        rmse = float(payload["final_rmse_px"])
+                        if rmse < snap.best_rmse:
+                            snap.best_rmse = rmse
+                    if "qac" in payload and payload["qac"] is not None:
+                        snap.qac = float(payload["qac"])
                 if evt.severity == "done":
                     snap.done = True
                 if evt.severity == "error":
@@ -751,13 +776,23 @@ def run_etna(
     )
 
     if event_queue is not None:
+        eval_count = metric_component._eval_idx
+        ms_per_step_avg = (total_time * 1000.0 / eval_count) if eval_count > 0 else 0.0
         event_queue.put(StatusEvent(
             kind="status",
             message="Done",
             severity="done",
             payload={
+                "backend": backend,
                 "total_time": total_time,
-                "eval_count": metric_component._eval_idx,
+                "compute_time": total_time,
+                "eval_count": eval_count,
+                "ms_per_step_avg": ms_per_step_avg,
+                "ref_size": ref_size,
+                "num_pyramid_levels": num_pyramid_levels,
+                # ETNA terminates at the finest pyramid level (L0 @ ref_size).
+                "level": 0,
+                "level_size": ref_size,
                 "transform": H.tolist() if hasattr(H, "tolist") else list(H),
                 "initial_rmse_px": initial_rmse,
                 "final_rmse_px": final_rmse,
@@ -1055,6 +1090,36 @@ def run_etna_async(fixed_img, moving_img, *, device, metric, optimizer, ref_size
             result_slot["error"] = exc
         finally:
             if rec_queue is not None:
+                # Allow the PowerSampler & Aggregator a moment to flush the
+                # last power_w sample so the summary line captures the most
+                # recent power_w / qac values.
+                time.sleep(0.3)
+                try:
+                    snap = aggregator.get_snapshot()
+                    res = result_slot.get("result")
+                    compute_time = res.total_time if res is not None else None
+                    final_rmse = (snap.best_rmse
+                                  if snap.best_rmse != float("inf") else None)
+                    rec_queue.put(StatusEvent(
+                        kind="status",
+                        message="Run summary",
+                        severity="summary",
+                        payload={
+                            "backend": snap.backend,
+                            "level": snap.active_level,
+                            "level_size": snap.level_size.get(snap.active_level),
+                            "total_evals": snap.total_evals,
+                            "compute_time": compute_time,
+                            "ms_per_step_last": snap.last_step_ms,
+                            "initial_rmse_px": snap.initial_rmse,
+                            "final_rmse_px": final_rmse,
+                            "power_w": snap.current_power_w,
+                            "qac": snap.qac,
+                        },
+                        wall_time=compute_time or 0.0,
+                    ))
+                except Exception as exc:
+                    print(f"WARNING: failed to record run summary: {exc}")
                 rec_queue.close()
 
     t = threading.Thread(target=_worker, name="etna-runner", daemon=True)
