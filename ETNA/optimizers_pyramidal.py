@@ -497,11 +497,10 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         Optimizations kept (pure speed wins, no accuracy cost):
         - Initial best_metric is computed at the seed (anti-drift baseline
           is meaningful from the very first sweep).
-        - On CPU only: best_metric is forwarded to goldsearch as
-          ``baseline_mi`` to skip the redundant evaluation at the seed.
-          On FPGA the metric has small per-call jitter that breaks the
-          anti-drift comparison if the baseline is stale, so we always
-          recompute it inside goldsearch when ``use_fpga=True``.
+        - best_metric is forwarded to goldsearch as ``baseline_mi`` on
+          both CPU and FPGA. The HLS MI pipeline is bit-deterministic so
+          the forwarded value matches a fresh recomputation. ~30 evals
+          saved per level.
 
         Reverted (was costing accuracy):
         - Theta-lock at level 0: refining theta at the finest level is
@@ -509,16 +508,11 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         - Per-level L0 budget bump (2,2,6): (1,1,3) matches baseline.
         - Per-level RNG seed (420 + level): reverted to RandomState(420)
           so the axis-shuffle trajectory matches baseline on every level.
+          (This was the FPGA accuracy culprit, not baseline_mi forwarding.)
         """
         best_params = par_lin.clone()
         matrix = metric_component.to_matrix_blocked(par_lin)
         best_metric = metric_component.compute_metric(ref_sup_2D, flt_sup, matrix, eref)
-
-        # On FPGA, forwarding best_metric as baseline_mi breaks the anti-drift
-        # check in goldsearch: HW MI has small per-call jitter, so a stale
-        # baseline biases the accept/reject decision and theta drifts off at
-        # L0. CPU MI is bit-deterministic, so the forwarding stays a free win.
-        forward_baseline = not getattr(metric_component, 'use_fpga', False)
 
         # Per-level budget. Coarser levels deserve more iterations because
         # they explore the parameter space; the finest level just refines.
@@ -563,7 +557,7 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
                     cur_par, cur_rng, ref_sup_2D, flt_sup,
                     par_lin, param_idx, metric_component, eref, level,
                     max_level=max_level,
-                    baseline_mi=best_metric if forward_baseline else None,
+                    baseline_mi=best_metric,
                 )
 
                 if cur_mi < best_metric:
