@@ -33,6 +33,28 @@ if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 from ETNA import EtnaMultiMetric, EtnaMultiPowell, EtnaMultiOnePlusOne  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Xilinx platform-stats (power monitoring) — optional
+# ---------------------------------------------------------------------------
+_XLNX_BINDINGS = (
+    _THIS_DIR.parent
+    / "ImageRegistration_for_RemoteSensing_Characterization"
+    / "xlnx_platformstats"
+    / "python-bindings"
+)
+XPLATFORMSTATS_AVAILABLE = False
+_xlnx = None
+try:
+    if _XLNX_BINDINGS.exists():
+        _b = str(_XLNX_BINDINGS)
+        if _b not in sys.path:
+            sys.path.insert(0, _b)
+    import xlnx_platformstats as _xlnx  # type: ignore
+    XPLATFORMSTATS_AVAILABLE = True
+    logger.info("xlnx_platformstats found — real-time power monitoring enabled.")
+except Exception as _xlnx_err:
+    logger.warning("xlnx_platformstats not available: %s", _xlnx_err)
 from gt_loader import load_ground_truth as _sb_load  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -52,6 +74,7 @@ class MetricEvent:
     value: float = 0.0
     transform: np.ndarray | None = None
     wall_time: float = 0.0
+    step_ms: float = 0.0  # wall-clock time for this single evaluation (ms)
     # Landmark RMSE against ground truth (if a .mat GT file was supplied).
     rmse_px: float | None = None
 
@@ -97,6 +120,10 @@ class LiveSnapshot:
     level_size: dict[int, int] = field(default_factory=dict)
     level_timings: dict[int, float] = field(default_factory=dict)
     level_start_time: dict[int, float] = field(default_factory=dict)
+
+    last_step_ms: float | None = None  # wall-clock duration of the most recent single eval
+    current_power_w: float | None = None   # most recent xlnx_platformstats reading
+    qac: float | None = None               # 100 / (best_rmse + power_w)
 
     # Backend / FPGA banner — last value seen.
     backend: str | None = None
@@ -171,6 +198,9 @@ class Aggregator:
                 level_size=dict(snap.level_size),
                 level_timings=dict(snap.level_timings),
                 level_start_time=dict(snap.level_start_time),
+                last_step_ms=snap.last_step_ms,
+                current_power_w=snap.current_power_w,
+                qac=snap.qac,
                 backend=snap.backend,
                 fpga_active=snap.fpga_active,
                 fpga_status_detail=snap.fpga_status_detail,
@@ -205,12 +235,24 @@ class Aggregator:
                     snap.final_result = self._result_slot["result"]
             snap.version += 1
 
+    @staticmethod
+    def _recompute_qac(snap: LiveSnapshot) -> None:
+        if snap.best_rmse != float("inf") and snap.current_power_w is not None:
+            denom = snap.best_rmse + snap.current_power_w
+            snap.qac = (100.0 / denom) if denom > 0 else None
+
     def _apply(self, evt) -> None:
         with self._lock:
             snap = self._snapshot
             if isinstance(evt, StatusEvent):
-                snap.status_messages.append(evt)
                 payload = evt.payload or {}
+                # Power samples are high-frequency — do not add to status_messages.
+                if "power_w" in payload:
+                    snap.current_power_w = float(payload["power_w"])
+                    self._recompute_qac(snap)
+                    snap.version += 1
+                    return
+                snap.status_messages.append(evt)
                 if "backend" in payload:
                     snap.backend = payload["backend"]
                 if "fpga_active" in payload:
@@ -237,6 +279,7 @@ class Aggregator:
                         snap.level_size[lvl] = int(evt.level_size)
             elif isinstance(evt, MetricEvent):
                 snap.total_evals += 1
+                snap.last_step_ms = evt.step_ms
                 lvl = max(0, min(self._num_levels - 1, evt.level))
                 snap.series.setdefault(lvl, []).append((snap.total_evals, evt.value))
                 if evt.rmse_px is not None and not (evt.rmse_px != evt.rmse_px):
@@ -245,6 +288,7 @@ class Aggregator:
                     )
                     if evt.rmse_px < snap.best_rmse:
                         snap.best_rmse = float(evt.rmse_px)
+                        self._recompute_qac(snap)
                 if evt.transform is not None:
                     snap.last_transform = evt.transform
             snap.version += 1
@@ -301,7 +345,9 @@ class InstrumentedMetric(EtnaMultiMetric):
         self._current_level_size = level_size
 
     def _compute_metric_instrumented(self, ref_img, flt_img, t_mat, eref):
+        _t0 = time.perf_counter()
         value = self._base_compute_metric(ref_img, flt_img, t_mat, eref)
+        step_ms = (time.perf_counter() - _t0) * 1000.0
 
         if self._event_queue is None:
             return value
@@ -349,6 +395,7 @@ class InstrumentedMetric(EtnaMultiMetric):
             value=val_f,
             transform=t_np,
             wall_time=time.time() - self._start_time,
+            step_ms=step_ms,
             rmse_px=rmse,
         ))
         return value
@@ -717,6 +764,50 @@ def run_etna(
 
 
 # ---------------------------------------------------------------------------
+# Power sampler (xlnx_platformstats)
+# ---------------------------------------------------------------------------
+
+class PowerSampler:
+    """Daemon thread that polls xlnx_platformstats and injects power readings
+    as lightweight StatusEvents so the Aggregator can keep QAC up to date."""
+
+    def __init__(self, event_queue: queue.Queue,
+                 worker_thread: threading.Thread,
+                 interval: float = 0.2):
+        self._q = event_queue
+        self._worker = worker_thread
+        self._interval = interval
+        self._thread = threading.Thread(
+            target=self._run, name="power-sampler", daemon=True,
+        )
+
+    def start(self) -> None:
+        if XPLATFORMSTATS_AVAILABLE:
+            self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            _xlnx.init()
+        except Exception as e:
+            logger.warning("xlnx init failed in PowerSampler: %s", e)
+            return
+        while self._worker.is_alive():
+            try:
+                pv = _xlnx.get_power()
+                if pv and len(pv) > 1:
+                    self._q.put(StatusEvent(
+                        kind="status",
+                        message="power",
+                        severity="info",
+                        payload={"power_w": float(pv[1])},
+                        wall_time=time.time(),
+                    ))
+            except Exception as e:
+                logger.debug("PowerSampler read error: %s", e)
+            time.sleep(self._interval)
+
+
+# ---------------------------------------------------------------------------
 # Threaded wrapper for the Streamlit main loop
 # ---------------------------------------------------------------------------
 
@@ -757,8 +848,10 @@ def run_etna_async(fixed_img, moving_img, *, device, metric, optimizer, ref_size
         event_queue=event_queue, num_levels=num_pyramid_levels,
         result_slot=result_slot, worker_thread=t,
     )
+    power_sampler = PowerSampler(event_queue=event_queue, worker_thread=t)
     t.start()
     aggregator.start()
+    power_sampler.start()
     return t, aggregator, result_slot
 
 

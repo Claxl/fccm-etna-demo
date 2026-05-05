@@ -270,13 +270,15 @@ with mid_cols[2]:
     rmse_slot = st.empty()
 
 st.markdown("---")
-kpi_cols = st.columns(6)
+kpi_cols = st.columns(8)
 backend_slot = kpi_cols[0].empty()
 level_slot = kpi_cols[1].empty()
 eval_slot = kpi_cols[2].empty()
 time_slot = kpi_cols[3].empty()
 rate_slot = kpi_cols[4].empty()
 rmse_kpi_slot = kpi_cols[5].empty()
+power_slot = kpi_cols[6].empty()
+qac_slot = kpi_cols[7].empty()
 
 
 def render_ladder(active_level: int, n_levels: int) -> str:
@@ -345,8 +347,10 @@ render_kpi(backend_slot, "Backend",
 render_kpi(level_slot, "Level", "—")
 render_kpi(eval_slot, "Metric evals", "0")
 render_kpi(time_slot, "Elapsed", "0.0 s")
-render_kpi(rate_slot, "Evals / s", "—")
+render_kpi(rate_slot, "ms / step", "—")
 render_kpi(rmse_kpi_slot, "RMSE (px)", "— / —")
+render_kpi(power_slot, "Power (W)", "—")
+render_kpi(qac_slot, "QAC", "—")
 
 
 # ---------------------------------------------------------------------------
@@ -559,8 +563,10 @@ def _run_and_stream():
         elapsed = time.time() - run_start
         render_kpi(eval_slot, "Metric evals", f"{snap.total_evals}")
         render_kpi(time_slot, "Elapsed", f"{elapsed:.2f} s")
-        render_kpi(rate_slot, "Evals / s",
-                   f"{snap.total_evals / max(elapsed, 1e-3):.1f}")
+        if snap.last_step_ms is not None:
+            render_kpi(rate_slot, "ms / step", f"{snap.last_step_ms:.1f}")
+        else:
+            render_kpi(rate_slot, "ms / step", "—")
         if snap.initial_rmse is not None and snap.best_rmse != float("inf"):
             delta_colour = ("#27ae60" if snap.best_rmse < snap.initial_rmse
                             else "#e74c3c")
@@ -570,6 +576,10 @@ def _run_and_stream():
         elif snap.initial_rmse is not None:
             render_kpi(rmse_kpi_slot, "RMSE (px)",
                        f"{snap.initial_rmse:.1f} → …", "#f39c12")
+        if snap.current_power_w is not None:
+            render_kpi(power_slot, "Power (W)", f"{snap.current_power_w:.2f}")
+        if snap.qac is not None:
+            render_kpi(qac_slot, "QAC", f"{snap.qac:.3f}")
 
         if snap.done and not thread.is_alive():
             break
