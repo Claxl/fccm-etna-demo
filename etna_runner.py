@@ -52,6 +52,7 @@ class MetricEvent:
     value: float = 0.0
     transform: np.ndarray | None = None
     wall_time: float = 0.0
+    step_ms: float = 0.0  # wall-clock time for this single evaluation (ms)
     # Landmark RMSE against ground truth (if a .mat GT file was supplied).
     rmse_px: float | None = None
 
@@ -97,6 +98,8 @@ class LiveSnapshot:
     level_size: dict[int, int] = field(default_factory=dict)
     level_timings: dict[int, float] = field(default_factory=dict)
     level_start_time: dict[int, float] = field(default_factory=dict)
+
+    last_step_ms: float | None = None  # wall-clock duration of the most recent single eval
 
     # Backend / FPGA banner — last value seen.
     backend: str | None = None
@@ -171,6 +174,7 @@ class Aggregator:
                 level_size=dict(snap.level_size),
                 level_timings=dict(snap.level_timings),
                 level_start_time=dict(snap.level_start_time),
+                last_step_ms=snap.last_step_ms,
                 backend=snap.backend,
                 fpga_active=snap.fpga_active,
                 fpga_status_detail=snap.fpga_status_detail,
@@ -237,6 +241,7 @@ class Aggregator:
                         snap.level_size[lvl] = int(evt.level_size)
             elif isinstance(evt, MetricEvent):
                 snap.total_evals += 1
+                snap.last_step_ms = evt.step_ms
                 lvl = max(0, min(self._num_levels - 1, evt.level))
                 snap.series.setdefault(lvl, []).append((snap.total_evals, evt.value))
                 if evt.rmse_px is not None and not (evt.rmse_px != evt.rmse_px):
@@ -301,7 +306,9 @@ class InstrumentedMetric(EtnaMultiMetric):
         self._current_level_size = level_size
 
     def _compute_metric_instrumented(self, ref_img, flt_img, t_mat, eref):
+        _t0 = time.perf_counter()
         value = self._base_compute_metric(ref_img, flt_img, t_mat, eref)
+        step_ms = (time.perf_counter() - _t0) * 1000.0
 
         if self._event_queue is None:
             return value
@@ -349,6 +356,7 @@ class InstrumentedMetric(EtnaMultiMetric):
             value=val_f,
             transform=t_np,
             wall_time=time.time() - self._start_time,
+            step_ms=step_ms,
             rmse_px=rmse,
         ))
         return value

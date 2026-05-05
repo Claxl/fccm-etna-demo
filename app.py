@@ -345,7 +345,7 @@ render_kpi(backend_slot, "Backend",
 render_kpi(level_slot, "Level", "—")
 render_kpi(eval_slot, "Metric evals", "0")
 render_kpi(time_slot, "Elapsed", "0.0 s")
-render_kpi(rate_slot, "Evals / s", "—")
+render_kpi(rate_slot, "ms / step", "—")
 render_kpi(rmse_kpi_slot, "RMSE (px)", "— / —")
 
 
@@ -559,8 +559,10 @@ def _run_and_stream():
         elapsed = time.time() - run_start
         render_kpi(eval_slot, "Metric evals", f"{snap.total_evals}")
         render_kpi(time_slot, "Elapsed", f"{elapsed:.2f} s")
-        render_kpi(rate_slot, "Evals / s",
-                   f"{snap.total_evals / max(elapsed, 1e-3):.1f}")
+        if snap.last_step_ms is not None:
+            render_kpi(rate_slot, "ms / step", f"{snap.last_step_ms:.1f}")
+        else:
+            render_kpi(rate_slot, "ms / step", "—")
         if snap.initial_rmse is not None and snap.best_rmse != float("inf"):
             delta_colour = ("#27ae60" if snap.best_rmse < snap.initial_rmse
                             else "#e74c3c")
