@@ -41,21 +41,37 @@ class EtnaMultiMetric(object):
         self.use_fpga = use_fpga
         self.fpga_accel = None
         self.device = "cpu"
+        # Optional sink for diagnostic StatusEvents emitted by the metric (set
+        # by InstrumentedMetric). Used to surface the *first* FPGA per-eval
+        # failure to the UI without spamming the queue.
+        self.diagnostics_sink = None
+        self._fpga_warned = False
+        # Set by run_etna once the accelerator is known. Tells us whether the
+        # caller actually wanted FPGA so the fallback message is meaningful.
+        self.fpga_status_detail: str | None = None
 
         if self.use_fpga:
             if FaberFPGAAccelerator:
                 try:
                     self.fpga_accel = FaberFPGAAccelerator()
+                    self.fpga_status_detail = getattr(
+                        self.fpga_accel, "status_detail", None
+                    )
                     if not self.fpga_accel.enabled:
-                        logger.warning("FPGA requested but failed to initialize. Falling back to software.")
+                        logger.warning(
+                            "FPGA requested but failed to initialize: %s",
+                            self.fpga_status_detail,
+                        )
                         self.use_fpga = False
                     else:
                         logger.info("FPGA acceleration ENABLED for Mutual Information (Pyramidal).")
                 except Exception as e:
                     logger.warning(f"Error initializing FPGA: {e}")
+                    self.fpga_status_detail = f"{type(e).__name__}: {e}"
                     self.use_fpga = False
             else:
                 logger.warning("ETNA FPGA module not found. FPGA disabled.")
+                self.fpga_status_detail = "FaberFPGAAccelerator import failed"
                 self.use_fpga = False
 
         self.compute_metric = None
@@ -163,6 +179,18 @@ class EtnaMultiMetric(object):
                 return torch.tensor(-mi_val, device=self.device)
             except Exception as e:
                 logger.warning(f"FPGA Error: {e}. Fallback to SW.")
+                if not self._fpga_warned:
+                    self._fpga_warned = True
+                    sink = self.diagnostics_sink
+                    if sink is not None:
+                        try:
+                            sink(
+                                "fpga_eval_fallback",
+                                f"FPGA per-eval call failed ({type(e).__name__}: {e}). "
+                                "Using software MI from now on.",
+                            )
+                        except Exception:
+                            pass
                 flt_warped = self.transform(flt_img, t_mat)
                 return -(self.mutual_information(ref_img.ravel(), flt_warped.ravel(), eref).cpu())
         else:
