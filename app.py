@@ -191,9 +191,9 @@ with st.sidebar:
         help="Coarse-to-fine resolution levels (1 = single-level, no pyramid).",
     )
 
-    run_clicked = st.button("Run ETNA", type="primary", use_container_width=True,
+    run_clicked = st.button("Run ETNA", type="primary", width="stretch",
                             disabled=pair_name is None)
-    reset_clicked = st.button("Reset", use_container_width=True)
+    reset_clicked = st.button("Reset", width="stretch")
 
     st.markdown("---")
     fpga_probe_active, fpga_probe_msg = detect_fpga_status(device == "FPGA")
@@ -239,18 +239,18 @@ with top_cols[0]:
     st.markdown("**Fixed**")
     fixed_slot = st.empty()
     fixed_slot.image(annotate(fixed_img, f"Fixed - {fixed_path.name}", (180, 180, 180)),
-                     channels="BGR", use_container_width=True)
+                     channels="BGR", width="stretch")
 with top_cols[1]:
     st.markdown("**Moving**")
     moving_slot = st.empty()
     moving_slot.image(annotate(moving_img, f"Moving - {moving_path.name}", (0, 128, 255)),
-                      channels="BGR", use_container_width=True)
+                      channels="BGR", width="stretch")
 with top_cols[2]:
     st.markdown("**Live overlay**")
     overlay_slot = st.empty()
     overlay_slot.image(
         annotate(make_fusion(fixed_img, moving_img), "initial overlay", (0, 0, 255)),
-        channels="BGR", use_container_width=True,
+        channels="BGR", width="stretch",
     )
 
 st.markdown("---")
@@ -325,7 +325,7 @@ _init_fig.update_layout(
     xaxis_title="metric eval #", yaxis_title="similarity value",
     showlegend=True, legend=dict(orientation="h", y=-0.2),
 )
-curve_slot.plotly_chart(_init_fig, use_container_width=True, key="curve-init")
+curve_slot.plotly_chart(_init_fig, width="stretch", key="curve-init")
 
 _init_rmse = go.Figure()
 _init_rmse.update_layout(
@@ -339,7 +339,7 @@ if gt_path is None:
         xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False,
         font=dict(color="#888"),
     )
-rmse_slot.plotly_chart(_init_rmse, use_container_width=True, key="rmse-init")
+rmse_slot.plotly_chart(_init_rmse, width="stretch", key="rmse-init")
 
 render_kpi(backend_slot, "Backend",
            "FPGA" if (device == "FPGA" and fpga_probe_active) else ("CPU" if device == "CPU" else "CPU fallback"),
@@ -478,7 +478,7 @@ def _run_and_stream():
                 annotate(make_fusion(fixed_img, warped_live),
                          f"live overlay - L{snap.active_level} | eval {snap.total_evals}",
                          level_bgr(max(0, snap.active_level))),
-                channels="BGR", use_container_width=True,
+                channels="BGR", width="stretch",
             )
             last_overlay_eval = snap.total_evals
             last_overlay_transform = snap.last_transform
@@ -509,7 +509,7 @@ def _run_and_stream():
                 xaxis_title="metric eval #", yaxis_title="similarity value",
                 showlegend=True, legend=dict(orientation="h", y=-0.2),
             )
-            curve_slot.plotly_chart(fig, use_container_width=True,
+            curve_slot.plotly_chart(fig, width="stretch",
                                     key=f"curve-{snap.total_evals}")
 
         # RMSE curve — rebuild only if the rmse series grew.
@@ -552,7 +552,7 @@ def _run_and_stream():
                 xaxis_title="metric eval #", yaxis_title="RMSE (px)",
                 showlegend=True, legend=dict(orientation="h", y=-0.2),
             )
-            rmse_slot.plotly_chart(rmse_fig, use_container_width=True,
+            rmse_slot.plotly_chart(rmse_fig, width="stretch",
                                    key=f"rmse-{snap.total_evals}")
 
         if snap.last_transform is not None:
@@ -640,16 +640,16 @@ if run_clicked:
             cc = st.columns(4)
             cc[0].image(annotate(make_fusion(result.fixed, result.moving), "before"),
                         channels="BGR", caption="Before — fused fixed ⊕ moving",
-                        use_container_width=True)
+                        width="stretch")
             cc[1].image(annotate(make_fusion(result.fixed, result.warped), "after"),
                         channels="BGR", caption="After — fused fixed ⊕ warped",
-                        use_container_width=True)
+                        width="stretch")
             cc[2].image(annotate(make_checkerboard(result.fixed, result.warped), "checker"),
                         channels="BGR", caption="Checkerboard 32×32",
-                        use_container_width=True)
+                        width="stretch")
             cc[3].image(annotate(make_difference(result.fixed, result.warped), "|diff|"),
                         channels="BGR", caption="Absolute diff (JET)",
-                        use_container_width=True)
+                        width="stretch")
 
         with tabs[1]:
             mc = st.columns(3)
@@ -723,7 +723,7 @@ if run_clicked:
                     st.image(annotate(err_img,
                                       f"GT (green) vs predicted (red) - RMSE {result.final_rmse_px:.2f} px",
                                       (0, 255, 0)),
-                             channels="BGR", use_container_width=True)
+                             channels="BGR", width="stretch")
                 with c2:
                     st.metric("Landmarks", f"{len(result.landmarks_mov_scaled)}")
                     st.metric("Initial RMSE",
@@ -742,7 +742,7 @@ if run_clicked:
                         xaxis_title="per-landmark error (px)",
                         yaxis_title="count",
                     )
-                    st.plotly_chart(hist_fig, use_container_width=True,
+                    st.plotly_chart(hist_fig, width="stretch",
                                     key="per-lm-hist")
 else:
     st.caption("Pick a pair in the sidebar and hit **Run ETNA** to start the live demo.")
@@ -766,12 +766,12 @@ def _render_layer_detail(level: int) -> None:
     c1, c2 = st.columns(2)
     if info.get("ref_img") is not None:
         c1.image(info["ref_img"], caption=f"Ref @ L{level}",
-                 use_container_width=True, channels="GRAY")
+                 width="stretch", channels="GRAY")
     else:
         c1.info("Ref preview unavailable.")
     if info.get("moving_img") is not None:
         c2.image(info["moving_img"], caption=f"Moving @ L{level}",
-                 use_container_width=True, channels="GRAY")
+                 width="stretch", channels="GRAY")
     else:
         c2.info("Moving preview unavailable.")
 
@@ -790,7 +790,7 @@ def _render_layer_detail(level: int) -> None:
         xaxis_title="metric eval #", yaxis_title="similarity value",
         showlegend=False,
     )
-    st.plotly_chart(mfig, use_container_width=True, key=f"detail-metric-{level}")
+    st.plotly_chart(mfig, width="stretch", key=f"detail-metric-{level}")
 
     if info["rmse_series"]:
         rfig = go.Figure()
@@ -805,7 +805,7 @@ def _render_layer_detail(level: int) -> None:
             xaxis_title="metric eval #", yaxis_title="RMSE (px)",
             showlegend=False,
         )
-        st.plotly_chart(rfig, use_container_width=True, key=f"detail-rmse-{level}")
+        st.plotly_chart(rfig, width="stretch", key=f"detail-rmse-{level}")
     else:
         st.caption("No ground-truth RMSE available for this layer.")
 
@@ -821,7 +821,7 @@ if st.session_state.get("per_level"):
     for i, col in enumerate(cols):
         is_selected = (i == st.session_state.get("selected_layer", 0))
         label = f"{'▶ ' if is_selected else ''}{level_label(i)}"
-        if col.button(label, key=f"layer-btn-{i}", use_container_width=True,
+        if col.button(label, key=f"layer-btn-{i}", width="stretch",
                       type="primary" if is_selected else "secondary"):
             st.session_state.selected_layer = i
             st.rerun()

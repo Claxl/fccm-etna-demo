@@ -15,7 +15,6 @@ The expected MATLAB structure matches the STAR-Bench convention:
 """
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from typing import Tuple
 
@@ -23,7 +22,6 @@ import cv2
 import numpy as np
 import scipy.io
 
-logger = logging.getLogger(__name__)
 
 
 def _extract_and_normalize_image(mat_data, image_key):
@@ -72,8 +70,8 @@ def load_ground_truth(mat_file_path: str | Path):
         mov_img = _extract_and_normalize_image(mat, "I_move")
         lm_fix, lm_mov = _extract_landmarks(mat)
         T = mat["T_reg_gt"]
-        logger.info("Loaded %d landmark pairs from %s.", len(lm_fix), mat_file.name)
+        print("Loaded %d landmark pairs from %s." % (len(lm_fix), mat_file.name))
         return fix_img, mov_img, lm_fix, lm_mov, T
     except Exception as exc:
-        logger.error("Error parsing GT file '%s': %s", mat_file.name, exc)
+        print("ERROR: Error parsing GT file '%s': %s" % (mat_file.name, exc))
         raise IOError(f"Failed to load/parse GT from {mat_file.name}") from exc

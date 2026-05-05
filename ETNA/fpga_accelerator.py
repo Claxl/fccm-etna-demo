@@ -9,20 +9,18 @@ The class is implemented as a singleton so that the overlay (a very expensive
 resource) is only loaded once per process even if multiple ETNA optimizers
 instantiate a metric.
 """
-import logging
 import os
 import time
 import numpy as np
 import torch
 
-logger = logging.getLogger(__name__)
 
 try:
     from pynq import Overlay, allocate
     PYNQ_AVAILABLE = True
 except ImportError:
     PYNQ_AVAILABLE = False
-    logger.warning("PYNQ libraries not found. FPGA acceleration will not be available.")
+    print("WARNING: PYNQ libraries not found. FPGA acceleration will not be available.")
 
 
 # Resolve the default bitstream path relative to this file so the module
@@ -93,7 +91,7 @@ class FaberFPGAAccelerator:
 
         if not os.path.exists(overlay_path):
             self.init_error = f"bitstream not found at {overlay_path}"
-            logger.error(f"FPGA Init Failed: {self.init_error}")
+            print(f"ERROR: FPGA Init Failed: {self.init_error}")
             return
 
         try:
@@ -109,7 +107,7 @@ class FaberFPGAAccelerator:
             # is still loading the bitstream. Retry a few times with backoff
             # before giving up so a previous Streamlit instance has time to
             # release the FPGA.
-            logger.info(f"Loading FPGA Overlay: {overlay_path}...")
+            print(f"Loading FPGA Overlay: {overlay_path}...")
             _attempts = 0
             while True:
                 try:
@@ -120,10 +118,8 @@ class FaberFPGAAccelerator:
                         raise
                     _attempts += 1
                     backoff = 0.5 * (2 ** _attempts)
-                    logger.warning(
-                        "Overlay load got ETXTBSY (Text file busy), retry "
-                        "%d in %.1fs...", _attempts, backoff,
-                    )
+                    print("WARNING: Overlay load got ETXTBSY (Text file busy), retry "
+                        "%d in %.1fs..." % (_attempts, backoff,))
                     time.sleep(backoff)
 
             # Resolve the accelerator IP block by known name or by substring.
@@ -155,11 +151,11 @@ class FaberFPGAAccelerator:
 
             self.enabled = True
             self._initialized = True
-            logger.info("FPGA Accelerator Ready (Optimized Uncached Mode).")
+            print("FPGA Accelerator Ready (Optimized Uncached Mode).")
 
         except Exception as e:
             self.init_error = f"{type(e).__name__}: {e}"
-            logger.error(f"FPGA Init Failed: {self.init_error}")
+            print(f"ERROR: FPGA Init Failed: {self.init_error}")
             self.enabled = False
 
     @property

@@ -7,7 +7,6 @@ Multi-resolution similarity metric (MI / MSE / CC / Parzen) used by the
 pyramidal code path can evolve separately from the non-pyramidal Faber
 implementation shipped as the ``faber_fpga`` submodule.
 """
-import logging
 import math
 
 import numpy as np
@@ -15,7 +14,6 @@ import torch
 import kornia
 from scipy import signal
 
-logger = logging.getLogger(__name__)
 
 try:
     from .fpga_accelerator import FaberFPGAAccelerator
@@ -58,19 +56,16 @@ class EtnaMultiMetric(object):
                         self.fpga_accel, "status_detail", None
                     )
                     if not self.fpga_accel.enabled:
-                        logger.warning(
-                            "FPGA requested but failed to initialize: %s",
-                            self.fpga_status_detail,
-                        )
+                        print("WARNING: FPGA requested but failed to initialize: %s" % (self.fpga_status_detail,))
                         self.use_fpga = False
                     else:
-                        logger.info("FPGA acceleration ENABLED for Mutual Information (Pyramidal).")
+                        print("FPGA acceleration ENABLED for Mutual Information (Pyramidal).")
                 except Exception as e:
-                    logger.warning(f"Error initializing FPGA: {e}")
+                    print(f"WARNING: Error initializing FPGA: {e}")
                     self.fpga_status_detail = f"{type(e).__name__}: {e}"
                     self.use_fpga = False
             else:
-                logger.warning("ETNA FPGA module not found. FPGA disabled.")
+                print("WARNING: ETNA FPGA module not found. FPGA disabled.")
                 self.fpga_status_detail = "FaberFPGAAccelerator import failed"
                 self.use_fpga = False
 
@@ -178,7 +173,7 @@ class EtnaMultiMetric(object):
                 mi_val = self.fpga_accel.compute_mi(ref_img, flt_img, t_mat)
                 return torch.tensor(-mi_val, device=self.device)
             except Exception as e:
-                logger.warning(f"FPGA Error: {e}. Fallback to SW.")
+                print(f"WARNING: FPGA Error: {e}. Fallback to SW.")
                 if not self._fpga_warned:
                     self._fpga_warned = True
                     sink = self.diagnostics_sink

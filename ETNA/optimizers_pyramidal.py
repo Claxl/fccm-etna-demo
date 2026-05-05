@@ -12,7 +12,6 @@ so that the pyramidal engine stays virtually separate from the non-pyramidal
 Faber implementation shipped as the ``faber_fpga`` submodule.
 """
 import time
-import logging
 from abc import ABCMeta, abstractmethod
 
 import numpy as np
@@ -22,7 +21,6 @@ import cv2
 
 from .hyperparams import FaberHyperParams
 
-logger = logging.getLogger(__name__)
 
 # Force CPU as default device (the module targets embedded FPGA boards such
 # as the Xilinx Kria KR260 where no GPU is available).
@@ -250,16 +248,16 @@ class EtnaMultiOnePlusOne(EtnaMultiSwOptimizers):
         Flt_uint8 = self._normalize_to_uint8(flt_tensor, device)
 
         if not use_pyramid or num_levels <= 1:
-            logger.info("[Pyramid] Single-level fallback")
+            print("[Pyramid] Single-level fallback")
             start_single = time.time()
             _, H = self.register_images(Ref_uint8, Flt_uint8, metric_component)
-            logger.info(f"[Pyramid] Single-level time: {time.time() - start_single:.4f}s")
+            print(f"[Pyramid] Single-level time: {time.time() - start_single:.4f}s")
             return H
 
         pyramid_start = time.time()
         flt_pyramid = ImagePyramid(Flt_uint8, num_levels, 0.5, device)
         ref_pyramid = ImagePyramid(Ref_uint8, num_levels, 0.5, device)
-        logger.info(f"[Pyramid] Construction time: {time.time() - pyramid_start:.4f}s")
+        print(f"[Pyramid] Construction time: {time.time() - pyramid_start:.4f}s")
 
         level_transforms = []
 
@@ -280,7 +278,7 @@ class EtnaMultiOnePlusOne(EtnaMultiSwOptimizers):
             )
             level_transforms.append(H_level.cpu().numpy())
 
-            logger.info(f"[Pyramid] Level {level} (size {tuple(ref_level.shape)}) time: {time.time() - level_start:.4f}s")
+            print(f"[Pyramid] Level {level} (size {tuple(ref_level.shape)}) time: {time.time() - level_start:.4f}s")
 
         return level_transforms[-1]
 
@@ -399,16 +397,16 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         Flt_uint8 = self._normalize_to_uint8(flt_tensor, device)
 
         if not use_pyramid or num_levels <= 1:
-            logger.info("[Pyramid] Single-level fallback")
+            print("[Pyramid] Single-level fallback")
             start_single = time.time()
             _, H = self.register_images(Ref_uint8, Flt_uint8, metric_component)
-            logger.info(f"[Pyramid] Single-level time: {time.time() - start_single:.4f}s")
+            print(f"[Pyramid] Single-level time: {time.time() - start_single:.4f}s")
             return H
 
         pyramid_start = time.time()
         flt_pyramid = ImagePyramid(Flt_uint8, num_levels, 0.5, device)
         ref_pyramid = ImagePyramid(Ref_uint8, num_levels, 0.5, device)
-        logger.info(f"[Pyramid] Construction time: {time.time() - pyramid_start:.4f}s")
+        print(f"[Pyramid] Construction time: {time.time() - pyramid_start:.4f}s")
 
         ordered_levels = flt_pyramid.get_ordered_levels()
         level_transforms = {}
@@ -437,7 +435,7 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
             level_transforms[level] = H_level.cpu().numpy()
             prev_level = level
 
-            logger.info(f"[Pyramid] Level {level} (size {tuple(ref_level.shape)}) time: {time.time() - level_start:.4f}s")
+            print(f"[Pyramid] Level {level} (size {tuple(ref_level.shape)}) time: {time.time() - level_start:.4f}s")
 
         return level_transforms[0]
 
@@ -529,10 +527,8 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
             it += 1
 
             if time.monotonic() - level_start > max_level_seconds:
-                logger.info(
-                    f"[Powell] Level {level}: wall-clock limit "
-                    f"({max_level_seconds:.0f}s) reached after {it} sweeps."
-                )
+                print(f"[Powell] Level {level}: wall-clock limit "
+                    f"({max_level_seconds:.0f}s) reached after {it} sweeps.")
                 break
 
             # Lock rotation at the finest level (just tx/ty refinement);

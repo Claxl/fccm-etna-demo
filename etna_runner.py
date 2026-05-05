@@ -11,7 +11,6 @@ subclass is the only instrumentation point.
 """
 from __future__ import annotations
 
-import logging
 import os
 import queue
 import sys
@@ -44,7 +43,6 @@ _XLNX_BINDINGS = (
     / "python-bindings"
 )
 
-logger = logging.getLogger(__name__)
 
 XPLATFORMSTATS_AVAILABLE = False
 _xlnx = None
@@ -55,9 +53,9 @@ try:
             sys.path.insert(0, _b)
     import xlnx_platformstats as _xlnx  # type: ignore
     XPLATFORMSTATS_AVAILABLE = True
-    logger.info("xlnx_platformstats found — real-time power monitoring enabled.")
+    print("xlnx_platformstats found — real-time power monitoring enabled.")
 except Exception as _xlnx_err:
-    logger.warning("xlnx_platformstats not available: %s", _xlnx_err)
+    print("WARNING: xlnx_platformstats not available: %s" % (_xlnx_err,))
 from gt_loader import load_ground_truth as _sb_load  # noqa: E402
 
 
@@ -439,7 +437,7 @@ def load_ground_truth(mat_path: str | Path) -> dict | None:
     try:
         fix_img, mov_img, lm_fix, lm_mov, T_gt = _sb_load(str(mat_path))
     except Exception as exc:
-        logger.warning("Could not read GT from %s: %s", mat_path, exc)
+        print("WARNING: Could not read GT from %s: %s" % (mat_path, exc))
         return None
     return {
         "fix_img": fix_img,
@@ -795,7 +793,7 @@ class PowerSampler:
         try:
             _xlnx.init()
         except Exception as e:
-            logger.warning("xlnx init failed in PowerSampler: %s", e)
+            print("WARNING: xlnx init failed in PowerSampler: %s" % (e,))
             return
         while self._worker.is_alive():
             try:
@@ -809,7 +807,7 @@ class PowerSampler:
                         wall_time=time.time(),
                     ))
             except Exception as e:
-                logger.debug("PowerSampler read error: %s", e)
+                print("PowerSampler read error: %s" % (e,))
             time.sleep(self._interval)
 
 
@@ -846,7 +844,9 @@ def run_etna_async(fixed_img, moving_img, *, device, metric, optimizer, ref_size
                 num_pyramid_levels=num_pyramid_levels,
             )
         except Exception as exc:
-            logger.exception("ETNA worker crashed")
+            import traceback
+            print("ERROR: ETNA worker crashed")
+            traceback.print_exc()
             result_slot["error"] = exc
 
     t = threading.Thread(target=_worker, name="etna-runner", daemon=True)

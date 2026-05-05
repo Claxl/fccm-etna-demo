@@ -17,7 +17,6 @@ Authors:
     Claudio Di Salvo, Emanuele Del Sozzo, Giuseppe Sorrentino,
     Eleonora D'Arnese, Paolo Panicucci, Davide Conficconi.
 """
-import logging
 import os
 import tempfile
 from pathlib import Path
@@ -25,7 +24,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-logger = logging.getLogger(__name__)
 
 
 class StageCache:
@@ -89,7 +87,7 @@ class PipelineExecutor:
                     self.factory.create_detector(name, self.device, **self.kwargs)
                 )
             except Exception as e:
-                logger.error(f"Failed to create stage '{name}' for the pipeline: {e}")
+                print(f"ERROR: Failed to create stage '{name}' for the pipeline: {e}")
                 raise
         return detectors
 
@@ -104,16 +102,14 @@ class PipelineExecutor:
         temp_files = []
 
         for i, stage_detector in enumerate(self.stages):
-            logger.info(
-                f"Running stage {i + 1}/{len(self.stages)}: {stage_detector.name.upper()}"
-            )
+            print(f"Running stage {i + 1}/{len(self.stages)}: {stage_detector.name.upper()}")
             stage_result = None
 
             if i == 0 and self.cache is not None:
                 cache_key = self.cache.get_key(stage_detector.name, fixed_path, moving_path)
                 cached = self.cache.get(cache_key)
                 if cached:
-                    logger.info(f"Using cached result for stage: {stage_detector.name}")
+                    print(f"Using cached result for stage: {stage_detector.name}")
                     stage_result = cached.copy()
                 else:
                     stage_result = stage_detector.register(
@@ -128,9 +124,7 @@ class PipelineExecutor:
                 h, w = fixed_img.shape[:2]
 
                 if M_composed is None:
-                    logger.error(
-                        f"Stage {i + 1}: cannot run refinement, invalid initial transform."
-                    )
+                    print(f"ERROR: Stage {i + 1}: cannot run refinement, invalid initial transform.")
                     results['failure_stage'] = i
                     break
 
@@ -152,9 +146,7 @@ class PipelineExecutor:
                 )
 
             if stage_result is None:
-                logger.critical(
-                    f"Stage {i + 1} ({stage_detector.name}) returned None; aborting."
-                )
+                print(f"CRITICAL: Stage {i + 1} ({stage_detector.name}) returned None; aborting.")
                 results['failure_stage'] = i + 1
                 break
 
@@ -162,9 +154,7 @@ class PipelineExecutor:
 
             M_stage = stage_result.get('transform')
             if M_stage is None:
-                logger.error(
-                    f"Stage {i + 1} ({stage_detector.name}) produced no transform; aborting."
-                )
+                print(f"ERROR: Stage {i + 1} ({stage_detector.name}) produced no transform; aborting.")
                 results['failure_stage'] = i + 1
                 break
 
@@ -175,7 +165,7 @@ class PipelineExecutor:
                 try:
                     os.unlink(f)
                 except Exception as e:
-                    logger.warning(f"Unable to delete temp file {f}: {e}")
+                    print(f"WARNING: Unable to delete temp file {f}: {e}")
 
         if results['stages']:
             s1 = results['stages'][0]
