@@ -33,9 +33,32 @@ if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 from ETNA import EtnaMultiMetric, EtnaMultiPowell, EtnaMultiOnePlusOne  # noqa: E402
-from gt_loader import load_ground_truth as _sb_load  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Xilinx platform-stats (power monitoring) — optional
+# ---------------------------------------------------------------------------
+_XLNX_BINDINGS = (
+    _THIS_DIR.parent
+    / "ImageRegistration_for_RemoteSensing_Characterization"
+    / "xlnx_platformstats"
+    / "python-bindings"
+)
 
 logger = logging.getLogger(__name__)
+
+XPLATFORMSTATS_AVAILABLE = False
+_xlnx = None
+try:
+    if _XLNX_BINDINGS.exists():
+        _b = str(_XLNX_BINDINGS)
+        if _b not in sys.path:
+            sys.path.insert(0, _b)
+    import xlnx_platformstats as _xlnx  # type: ignore
+    XPLATFORMSTATS_AVAILABLE = True
+    logger.info("xlnx_platformstats found — real-time power monitoring enabled.")
+except Exception as _xlnx_err:
+    logger.warning("xlnx_platformstats not available: %s", _xlnx_err)
+from gt_loader import load_ground_truth as _sb_load  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +75,7 @@ class MetricEvent:
     value: float = 0.0
     transform: np.ndarray | None = None
     wall_time: float = 0.0
+    step_ms: float = 0.0  # wall-clock time for this single evaluation (ms)
     # Landmark RMSE against ground truth (if a .mat GT file was supplied).
     rmse_px: float | None = None
 
@@ -74,6 +98,206 @@ class StatusEvent:
     severity: str = "info"  # "info" | "warning" | "error" | "done"
     payload: dict = field(default_factory=dict)
     wall_time: float = 0.0
+
+
+@dataclass
+class LiveSnapshot:
+    """Thread-safe snapshot of the live run state, produced by ``Aggregator``.
+
+    The Streamlit main thread polls ``Aggregator.get_snapshot()`` and only
+    re-renders when ``version`` changes; this decouples ETNA emission from UI
+    work so a slow Plotly round-trip cannot starve the optimizer.
+    """
+    version: int = 0
+    total_evals: int = 0
+    active_level: int = -1
+    last_transform: np.ndarray | None = None
+    initial_rmse: float | None = None
+    best_rmse: float = float("inf")
+
+    # per-level series of (eval_idx, value) tuples
+    series: dict[int, list[tuple[int, float]]] = field(default_factory=dict)
+    rmse_series: dict[int, list[tuple[int, float]]] = field(default_factory=dict)
+    level_size: dict[int, int] = field(default_factory=dict)
+    level_timings: dict[int, float] = field(default_factory=dict)
+    level_start_time: dict[int, float] = field(default_factory=dict)
+
+    last_step_ms: float | None = None  # wall-clock duration of the most recent single eval
+    current_power_w: float | None = None   # most recent xlnx_platformstats reading
+    qac: float | None = None               # 100 / (best_rmse + power_w)
+
+    # Backend / FPGA banner — last value seen.
+    backend: str | None = None
+    fpga_active: bool = False
+    fpga_status_detail: str | None = None
+
+    # Status messages (info / warning / error / done).
+    status_messages: list[StatusEvent] = field(default_factory=list)
+
+    done: bool = False
+    error: str | None = None
+
+    # Mirror of run_etna's RunResult once the ETNA worker finishes.
+    final_result: "RunResult | None" = None
+
+
+class Aggregator:
+    """Daemon thread that drains an event queue into a ``LiveSnapshot``.
+
+    Why this exists: Streamlit slots can only be updated from the main thread,
+    but draining ``event_q`` and recomputing per-level series is pure data
+    work. Doing it in a dedicated thread frees the main thread to do UI work
+    at its own pace and keeps the event queue from backing up — without it,
+    one slow Plotly round-trip can stall the optimizer.
+
+    The snapshot is updated under a lock; ``get_snapshot()`` returns a cheap
+    shallow copy so the renderer can read it without holding the lock.
+    """
+
+    def __init__(self, event_queue: "queue.Queue", num_levels: int,
+                 result_slot: dict | None = None,
+                 worker_thread: threading.Thread | None = None):
+        self._event_queue = event_queue
+        self._num_levels = num_levels
+        self._result_slot = result_slot
+        self._worker_thread = worker_thread
+        self._lock = threading.Lock()
+        self._snapshot = LiveSnapshot(
+            series={i: [] for i in range(num_levels)},
+            rmse_series={i: [] for i in range(num_levels)},
+        )
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="etna-aggregator", daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def is_running(self) -> bool:
+        return self._thread.is_alive()
+
+    def get_snapshot(self) -> LiveSnapshot:
+        """Return a cheap shallow copy of the current snapshot."""
+        with self._lock:
+            snap = self._snapshot
+            return LiveSnapshot(
+                version=snap.version,
+                total_evals=snap.total_evals,
+                active_level=snap.active_level,
+                last_transform=snap.last_transform,
+                initial_rmse=snap.initial_rmse,
+                best_rmse=snap.best_rmse,
+                # series lists are append-only; sharing the reference is safe
+                # because the renderer only reads them. We do *not* copy them
+                # to keep get_snapshot O(1).
+                series=snap.series,
+                rmse_series=snap.rmse_series,
+                level_size=dict(snap.level_size),
+                level_timings=dict(snap.level_timings),
+                level_start_time=dict(snap.level_start_time),
+                last_step_ms=snap.last_step_ms,
+                current_power_w=snap.current_power_w,
+                qac=snap.qac,
+                backend=snap.backend,
+                fpga_active=snap.fpga_active,
+                fpga_status_detail=snap.fpga_status_detail,
+                status_messages=list(snap.status_messages),
+                done=snap.done,
+                error=snap.error,
+                final_result=snap.final_result,
+            )
+
+    def _run(self) -> None:
+        worker = self._worker_thread
+        while not self._stop.is_set():
+            try:
+                evt = self._event_queue.get(timeout=0.1)
+            except queue.Empty:
+                # Worker finished and queue drained -> finalize.
+                if worker is not None and not worker.is_alive() \
+                        and self._event_queue.empty():
+                    self._finalize()
+                    return
+                continue
+            self._apply(evt)
+
+    def _finalize(self) -> None:
+        with self._lock:
+            snap = self._snapshot
+            snap.done = True
+            if self._result_slot is not None:
+                if "error" in self._result_slot:
+                    snap.error = str(self._result_slot["error"])
+                if "result" in self._result_slot:
+                    snap.final_result = self._result_slot["result"]
+            snap.version += 1
+
+    @staticmethod
+    def _recompute_qac(snap: LiveSnapshot) -> None:
+        if (snap.best_rmse != float("inf")
+                and snap.current_power_w is not None
+                and snap.last_step_ms is not None):
+            # EN = energy per step: raw µW → W, step_ms → s
+            en = (snap.current_power_w / 1_000_000) * (snap.last_step_ms / 1000)
+            denom = snap.best_rmse + en
+            snap.qac = (100.0 / denom) if denom > 0 else None
+
+    def _apply(self, evt) -> None:
+        with self._lock:
+            snap = self._snapshot
+            if isinstance(evt, StatusEvent):
+                payload = evt.payload or {}
+                # Power samples are high-frequency — do not add to status_messages.
+                if "power_w" in payload:
+                    snap.current_power_w = float(payload["power_w"])
+                    self._recompute_qac(snap)
+                    snap.version += 1
+                    return
+                snap.status_messages.append(evt)
+                if "backend" in payload:
+                    snap.backend = payload["backend"]
+                if "fpga_active" in payload:
+                    snap.fpga_active = bool(payload["fpga_active"])
+                if "fpga_status_detail" in payload:
+                    snap.fpga_status_detail = payload["fpga_status_detail"]
+                if "initial_rmse_px" in payload and snap.initial_rmse is None:
+                    snap.initial_rmse = float(payload["initial_rmse_px"])
+                if evt.severity == "done":
+                    snap.done = True
+                if evt.severity == "error":
+                    snap.error = evt.message
+            elif isinstance(evt, LevelEvent):
+                if evt.phase == "start":
+                    now = time.time()
+                    if snap.active_level >= 0 \
+                            and snap.active_level in snap.level_start_time:
+                        elapsed = now - snap.level_start_time[snap.active_level]
+                        snap.level_timings[snap.active_level] = elapsed
+                    lvl = max(0, min(self._num_levels - 1, evt.level))
+                    snap.active_level = lvl
+                    snap.level_start_time[lvl] = now
+                    if evt.level_size:
+                        snap.level_size[lvl] = int(evt.level_size)
+            elif isinstance(evt, MetricEvent):
+                snap.total_evals += 1
+                snap.last_step_ms = evt.step_ms
+                self._recompute_qac(snap)
+                lvl = max(0, min(self._num_levels - 1, evt.level))
+                snap.series.setdefault(lvl, []).append((snap.total_evals, evt.value))
+                if evt.rmse_px is not None and not (evt.rmse_px != evt.rmse_px):
+                    snap.rmse_series.setdefault(lvl, []).append(
+                        (snap.total_evals, float(evt.rmse_px))
+                    )
+                    if evt.rmse_px < snap.best_rmse:
+                        snap.best_rmse = float(evt.rmse_px)
+                        self._recompute_qac(snap)
+                if evt.transform is not None:
+                    snap.last_transform = evt.transform
+            snap.version += 1
 
 
 @dataclass
@@ -127,7 +351,9 @@ class InstrumentedMetric(EtnaMultiMetric):
         self._current_level_size = level_size
 
     def _compute_metric_instrumented(self, ref_img, flt_img, t_mat, eref):
+        _t0 = time.perf_counter()
         value = self._base_compute_metric(ref_img, flt_img, t_mat, eref)
+        step_ms = (time.perf_counter() - _t0) * 1000.0
 
         if self._event_queue is None:
             return value
@@ -175,6 +401,7 @@ class InstrumentedMetric(EtnaMultiMetric):
             value=val_f,
             transform=t_np,
             wall_time=time.time() - self._start_time,
+            step_ms=step_ms,
             rmse_px=rmse,
         ))
         return value
@@ -327,7 +554,13 @@ def _compute_landmark_rmse(H_level: np.ndarray, level_size: int, ref_size: int,
 # ---------------------------------------------------------------------------
 
 def detect_fpga_status(want_fpga: bool) -> tuple[bool, str]:
-    """Return (fpga_actually_active, human_readable_status)."""
+    """Return (fpga_actually_active, human_readable_status).
+
+    Performs a *strong* probe: actually instantiates the singleton and asks it
+    to load the bitstream. Thanks to the retry-safe singleton in
+    ``FaberFPGAAccelerator``, a probe failure here does not poison the run —
+    ``run_etna`` will reattempt initialization with a fresh constructor call.
+    """
     if not want_fpga:
         return False, "CPU (PyTorch / Kornia)"
     try:
@@ -335,18 +568,13 @@ def detect_fpga_status(want_fpga: bool) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"FPGA module import failed: {exc}"
     try:
-        from ETNA.fpga_accelerator import PYNQ_AVAILABLE
-    except Exception:
-        PYNQ_AVAILABLE = False
-    if not PYNQ_AVAILABLE:
-        return False, "FPGA requested, PYNQ unavailable -> software fallback"
-    try:
         accel = FaberFPGAAccelerator()
-        if getattr(accel, "enabled", False):
-            return True, "FPGA active: wax_mi_accel overlay loaded"
-        return False, "FPGA requested, overlay failed -> software fallback"
     except Exception as exc:
-        return False, f"FPGA init error: {exc} -> software fallback"
+        return False, f"FPGA init error ({type(exc).__name__}: {exc})"
+    detail = getattr(accel, "status_detail", None)
+    if getattr(accel, "enabled", False):
+        return True, detail or "FPGA active: overlay loaded"
+    return False, detail or "FPGA disabled (unknown reason)"
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +625,12 @@ def run_etna(
         event_queue.put(StatusEvent(
             message=f"Backend: {backend} — {fpga_status}",
             severity="info" if fpga_active or not want_fpga else "warning",
-            payload={"backend": backend, "fpga_active": fpga_active},
+            payload={
+                "backend": backend,
+                "fpga_active": fpga_active,
+                "fpga_status_detail": fpga_status,
+                "want_fpga": want_fpga,
+            },
             wall_time=0.0,
         ))
 
@@ -439,6 +672,29 @@ def run_etna(
         T_gt_ref=T_gt_ref,
     )
 
+    # If the user wanted FPGA but the metric component disabled itself, surface
+    # the reason once via a StatusEvent (so the UI can show it without parsing
+    # logs). The metric also re-emits a one-shot warning on the *first* per-eval
+    # FPGA call that fails, via the diagnostics_sink we install below.
+    if want_fpga and not metric_component.use_fpga and event_queue is not None:
+        event_queue.put(StatusEvent(
+            message=(f"FPGA requested but disabled: "
+                     f"{metric_component.fpga_status_detail or 'unknown reason'}"),
+            severity="warning",
+            payload={"fpga_status_detail": metric_component.fpga_status_detail},
+            wall_time=time.time() - start,
+        ))
+
+    if event_queue is not None:
+        def _fpga_diag_sink(tag: str, message: str) -> None:
+            event_queue.put(StatusEvent(
+                message=message,
+                severity="warning",
+                payload={"diagnostic": tag},
+                wall_time=time.time() - start,
+            ))
+        metric_component.diagnostics_sink = _fpga_diag_sink
+
     opt_cls = EtnaMultiPowell if optimizer == "powell" else EtnaMultiOnePlusOne
     opt = opt_cls()
 
@@ -464,7 +720,7 @@ def run_etna(
     warped = cv2.warpAffine(
         moving_img if moving_img.shape[0] == ref_size else
         cv2.resize(moving_img, (ref_size, ref_size), interpolation=cv2.INTER_AREA),
-        H.astype(np.float32), (ref_size, ref_size),
+        np.asarray(H, dtype=np.float32), (ref_size, ref_size),
         flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
 
@@ -514,17 +770,69 @@ def run_etna(
 
 
 # ---------------------------------------------------------------------------
+# Power sampler (xlnx_platformstats)
+# ---------------------------------------------------------------------------
+
+class PowerSampler:
+    """Daemon thread that polls xlnx_platformstats and injects power readings
+    as lightweight StatusEvents so the Aggregator can keep QAC up to date."""
+
+    def __init__(self, event_queue: queue.Queue,
+                 worker_thread: threading.Thread,
+                 interval: float = 0.2):
+        self._q = event_queue
+        self._worker = worker_thread
+        self._interval = interval
+        self._thread = threading.Thread(
+            target=self._run, name="power-sampler", daemon=True,
+        )
+
+    def start(self) -> None:
+        if XPLATFORMSTATS_AVAILABLE:
+            self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            _xlnx.init()
+        except Exception as e:
+            logger.warning("xlnx init failed in PowerSampler: %s", e)
+            return
+        while self._worker.is_alive():
+            try:
+                pv = _xlnx.get_power()
+                if pv and len(pv) > 1:
+                    self._q.put(StatusEvent(
+                        kind="status",
+                        message="power",
+                        severity="info",
+                        payload={"power_w": float(pv[1])},
+                        wall_time=time.time(),
+                    ))
+            except Exception as e:
+                logger.debug("PowerSampler read error: %s", e)
+            time.sleep(self._interval)
+
+
+# ---------------------------------------------------------------------------
 # Threaded wrapper for the Streamlit main loop
 # ---------------------------------------------------------------------------
 
 def run_etna_async(fixed_img, moving_img, *, device, metric, optimizer, ref_size,
                    event_queue, gt_mat_path: str | Path | None = None,
                    num_pyramid_levels: int = 4,
-                   ) -> tuple[threading.Thread, dict]:
-    """Launch ``run_etna`` on a background thread.
+                   ) -> tuple[threading.Thread, Aggregator, dict]:
+    """Launch ``run_etna`` on a background thread *and* a snapshot aggregator.
 
-    The returned ``result_slot`` dict is populated with key ``"result"`` (on
-    success) or ``"error"`` (on failure) once the worker finishes.
+    Returns ``(etna_thread, aggregator, result_slot)``:
+
+    - ``etna_thread``: the ETNA worker. Pushes events on ``event_queue``.
+    - ``aggregator``: a daemon thread that drains ``event_queue`` and exposes a
+      thread-safe ``LiveSnapshot`` via ``aggregator.get_snapshot()``. The
+      Streamlit main thread should read from the snapshot rather than from
+      ``event_queue`` directly so its UI work cannot back-pressure the
+      optimizer.
+    - ``result_slot``: dict populated by the worker with ``"result"`` (on
+      success) or ``"error"`` (on failure) once the worker finishes.
     """
     result_slot: dict = {}
 
@@ -542,8 +850,15 @@ def run_etna_async(fixed_img, moving_img, *, device, metric, optimizer, ref_size
             result_slot["error"] = exc
 
     t = threading.Thread(target=_worker, name="etna-runner", daemon=True)
+    aggregator = Aggregator(
+        event_queue=event_queue, num_levels=num_pyramid_levels,
+        result_slot=result_slot, worker_thread=t,
+    )
+    power_sampler = PowerSampler(event_queue=event_queue, worker_thread=t)
     t.start()
-    return t, result_slot
+    aggregator.start()
+    power_sampler.start()
+    return t, aggregator, result_slot
 
 
 # ---------------------------------------------------------------------------

@@ -48,12 +48,36 @@ class FaberFPGAAccelerator:
             cls._instance._initialized = False
         return cls._instance
 
+    @classmethod
+    def reset(cls) -> None:
+        """Drop the cached singleton so the next constructor call retries init."""
+        inst = cls._instance
+        if inst is not None:
+            try:
+                inst.close()
+            except Exception:
+                pass
+        cls._instance = None
+
     def __init__(self, overlay_path: str = _DEFAULT_OVERLAY):
-        # Skip re-initialization (singleton semantics).
-        if self._initialized:
+        # Skip re-initialization once we have a *successful* singleton. Failed
+        # init attempts leave _initialized=False so the next constructor call
+        # retries — important when the sidebar probe fires before the overlay
+        # is ready (e.g. another process holding the device).
+        if getattr(self, "_initialized", False):
             return
 
         self.enabled = False
+        self.overlay_path = overlay_path
+        self.pynq_available = PYNQ_AVAILABLE
+        self.init_error: str | None = None
+        self.overlay = None
+        self.ip = None
+        self.current_shape = (0, 0)
+        self.input_flt_buffer = None
+        self.input_ref_buffer = None
+        self.transform_buffer = None
+        self.mi_hls_buffer = None
 
         # Cache state: used to avoid redundant AXI-Lite register writes.
         self._last_ref_id = None
@@ -61,10 +85,23 @@ class FaberFPGAAccelerator:
         self._registers_configured = False
 
         if not PYNQ_AVAILABLE:
-            self._initialized = True
+            self.init_error = "PYNQ not installed (pip install pynq)"
+            return
+
+        if not os.path.exists(overlay_path):
+            self.init_error = f"bitstream not found at {overlay_path}"
+            logger.error(f"FPGA Init Failed: {self.init_error}")
             return
 
         try:
+            # PYNQ uses asyncio for device discovery; Streamlit's ScriptRunner
+            # thread has no event loop — create one if needed.
+            import asyncio
+            try:
+                asyncio.get_event_loop()
+            except RuntimeError:
+                asyncio.set_event_loop(asyncio.new_event_loop())
+
             logger.info(f"Loading FPGA Overlay: {overlay_path}...")
             self.overlay = Overlay(overlay_path)
 
@@ -77,7 +114,10 @@ class FaberFPGAAccelerator:
                         self.ip = getattr(self.overlay, ip_name)
                         break
                 else:
-                    raise RuntimeError("No suitable accelerator IP found.")
+                    raise RuntimeError(
+                        f"no wax/accel IP found in overlay (have: "
+                        f"{list(self.overlay.ip_dict.keys())})"
+                    )
 
             # AXI-Lite register offsets exposed by the HLS core
             self.OFFSET_CTRL      = 0x00
@@ -88,31 +128,34 @@ class FaberFPGAAccelerator:
             self.OFFSET_ROWS      = 0x40
             self.OFFSET_COLS      = 0x48
 
-            self.current_shape = (0, 0)
-            self.input_flt_buffer = None
-            self.input_ref_buffer = None
-
             # Uncached DMA buffers for the transform matrix and MI result.
-            # Uncached allocation avoids the need to flush caches manually and
-            # is the simplest way to guarantee coherency with the HLS core.
             self.transform_buffer = allocate(shape=(16,), dtype=np.float32, cacheable=False)
             self.mi_hls_buffer = allocate(shape=(16,), dtype=np.float32, cacheable=False)
 
             self.enabled = True
+            self._initialized = True
             logger.info("FPGA Accelerator Ready (Optimized Uncached Mode).")
 
         except Exception as e:
-            logger.error(f"FPGA Init Failed: {e}")
+            self.init_error = f"{type(e).__name__}: {e}"
+            logger.error(f"FPGA Init Failed: {self.init_error}")
             self.enabled = False
 
-        self._initialized = True
+    @property
+    def status_detail(self) -> str:
+        """Short human-readable status string for the UI."""
+        if self.enabled:
+            return f"FPGA active: overlay loaded from {self.overlay_path}"
+        if self.init_error:
+            return f"FPGA disabled: {self.init_error}"
+        return "FPGA disabled"
 
     def _ensure_buffers(self, rows: int, cols: int):
         """Lazily (re)allocate the input image buffers if the shape changed."""
         if (rows, cols) != self.current_shape:
-            if self.input_flt_buffer:
+            if self.input_flt_buffer is not None:
                 self.input_flt_buffer.freebuffer()
-            if self.input_ref_buffer:
+            if self.input_ref_buffer is not None:
                 self.input_ref_buffer.freebuffer()
 
             # Direct-mapped RAM buffers (no CPU caching)
@@ -134,7 +177,7 @@ class FaberFPGAAccelerator:
         the first call or when the shape / input buffers change.
         """
         if not self.enabled:
-            return 0.0
+            raise RuntimeError(self.init_error or "FPGA accelerator not enabled")
 
         # 1) Convert torch tensors to numpy (zero-copy when possible)
         ref_np = ref_tensor.detach().cpu().numpy() if isinstance(ref_tensor, torch.Tensor) else ref_tensor
@@ -195,14 +238,11 @@ class FaberFPGAAccelerator:
 
     def close(self):
         """Release the DMA buffers held by this accelerator."""
-        try:
-            if self.input_flt_buffer:
-                self.input_flt_buffer.freebuffer()
-            if self.input_ref_buffer:
-                self.input_ref_buffer.freebuffer()
-            if self.transform_buffer:
-                self.transform_buffer.freebuffer()
-            if self.mi_hls_buffer:
-                self.mi_hls_buffer.freebuffer()
-        except Exception:
-            pass
+        for name in ("input_flt_buffer", "input_ref_buffer",
+                     "transform_buffer", "mi_hls_buffer"):
+            buf = getattr(self, name, None)
+            if buf is not None:
+                try:
+                    buf.freebuffer()
+                except Exception:
+                    pass
