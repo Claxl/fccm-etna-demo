@@ -11,6 +11,7 @@ instantiate a metric.
 """
 import logging
 import os
+import time
 import numpy as np
 import torch
 
@@ -229,9 +230,20 @@ class FaberFPGAAccelerator:
         # 5) Kick the accelerator
         self.ip.write(self.OFFSET_CTRL, 0x01)
 
-        # 6) Busy wait for the done flag (faster than sleep for short kernels)
+        # 6) Poll for AP_DONE (bit 1).  Timeout after 5 s to avoid hanging
+        # forever when the kernel stalls (e.g. DMA fault, bad address).
+        _deadline = time.monotonic() + 5.0
         while not (self.ip.read(self.OFFSET_CTRL) & 0x02):
-            pass
+            if time.monotonic() > _deadline:
+                # Force-idle the core and mark the accelerator unusable so the
+                # caller falls back to software MI.
+                try:
+                    self.ip.write(self.OFFSET_CTRL, 0x00)
+                except Exception:
+                    pass
+                self.enabled = False
+                self.init_error = "AP_DONE timeout (FPGA kernel stalled)"
+                raise RuntimeError(self.init_error)
 
         # 7) Return the MI estimate
         return float(self.mi_hls_buffer[0])

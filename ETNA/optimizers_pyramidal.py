@@ -481,8 +481,9 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         return flt_transform, params_trans
 
     def optimize_powell_adaptive(self, rng, par_lin, ref_sup_2D, flt_sup,
-                                 metric_component, eref, level, max_iterations_override=None, max_level: int = 4):
-        """Powell iterations with per-level tolerance and randomized parameter order."""
+                                 metric_component, eref, level, max_iterations_override=None,
+                                 max_level: int = 4, max_level_seconds: float = 20.0):
+        """Powell iterations with per-level tolerance, patience, and wall-clock timeout."""
         converged = False
         eps = AdaptiveParameters.get_tolerance(level, max_level, 'powell')
         max_iterations = max_iterations_override or AdaptiveParameters.get_iterations(level, max_level, 'powell')
@@ -494,16 +495,29 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
 
         rand_gen = np.random.RandomState(420)
 
-        # Patience-based early stop: hand control to the next pyramid level
-        # when best_metric stops improving by more than `eps` across
-        # `patience` consecutive sweeps (local-minimum detection).
-        patience = max(3, max_iterations // 10)
+        # Two complementary early-stop mechanisms:
+        # 1. Patience: exit when best_metric has not improved by >eps for
+        #    `patience` consecutive sweeps (local-minimum detection).
+        # 2. Wall-clock: exit when we have spent more than `max_level_seconds`
+        #    on this pyramid level (prevents multi-minute hangs with slow
+        #    per-eval backends such as the FPGA kernel).
+        patience = max(3, max_iterations // 20)
         stuck_sweeps = 0
         last_best_metric = best_metric
+        level_start = time.monotonic()
 
         while not converged and it < max_iterations:
             converged = True
             it += 1
+
+            # Wall-clock guard — check once per sweep (cheap).
+            if time.monotonic() - level_start > max_level_seconds:
+                logger.info(
+                    f"[Powell] Level {level}: wall-clock limit "
+                    f"({max_level_seconds:.0f}s) reached after {it} sweeps, "
+                    "advancing to next pyramid level."
+                )
+                break
 
             # At the coarse level we keep the axis order fixed so that the
             # initial sweep is deterministic; finer levels shuffle.
