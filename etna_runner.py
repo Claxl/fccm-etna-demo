@@ -32,7 +32,10 @@ _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
+logger = logging.getLogger(__name__)
+
 from ETNA import EtnaMultiMetric, EtnaMultiPowell, EtnaMultiOnePlusOne  # noqa: E402
+from gt_loader import load_ground_truth as _sb_load  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Xilinx platform-stats (power monitoring) — optional
@@ -55,9 +58,6 @@ try:
     logger.info("xlnx_platformstats found — real-time power monitoring enabled.")
 except Exception as _xlnx_err:
     logger.warning("xlnx_platformstats not available: %s", _xlnx_err)
-from gt_loader import load_ground_truth as _sb_load  # noqa: E402
-
-logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
