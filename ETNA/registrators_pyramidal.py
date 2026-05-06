@@ -250,16 +250,21 @@ class EtnaMultiMetric(object):
     def compute_mi_exponential(self, ref_img, flt_img, t_mat, eref):
         mi = self.compute_mi(ref_img, flt_img, t_mat, eref)
         _t = time.perf_counter()
-        # math.exp on a Python float — was torch.exp(0-d).cpu() (~5 ms/call).
-        # The original path stored values in float32 (torch.tensor default
-        # dtype + torch.exp on a float32 tensor), so the optimizer compared
-        # FP32-precision metrics. Cast back to float32 here to keep the same
-        # comparison precision: in pure-FP64 the optimizer can distinguish
-        # values that differ below the float32 ULP and ends up on a slightly
-        # different (worse) trajectory.
+        # The original path was torch.exp(torch.tensor(-mi_val)).cpu(), i.e.
+        # exp computed *in* float32. Replacing it with math.exp(...)+np.float32
+        # was almost-but-not-quite bit-equivalent: math.exp does the exp in
+        # float64 and then rounds to float32, which can produce a different
+        # last-bit FP32 result than libm's expf used by torch.exp. With strict
+        # `<` comparisons in goldsearch/Powell that 1-ULP wobble is enough to
+        # send the optimizer down a slightly different (worse) trajectory.
+        # Use torch.exp on a single 1-element float32 tensor: bit-for-bit the
+        # same numerical path as the original, no extra allocations beyond
+        # what the original already paid.
         if isinstance(mi, torch.Tensor):
-            mi = float(mi.item())
-        result = float(np.float32(math.exp(mi)))
+            mi_t = mi.detach().float()
+        else:
+            mi_t = torch.tensor(mi, dtype=torch.float32)
+        result = float(torch.exp(mi_t))
         self._wrap_times["compute_mi_exp"] += time.perf_counter() - _t
         self._wrap_counts["compute_mi_exp"] += 1
         return result
