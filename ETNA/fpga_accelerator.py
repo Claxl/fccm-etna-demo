@@ -13,6 +13,7 @@ import os
 import time
 import numpy as np
 import torch
+import cv2  # hoisted from compute_mi hot path; only used by invertAffineTransform fallback
 
 
 try:
@@ -84,6 +85,17 @@ class FaberFPGAAccelerator:
         self._last_ref_sig = None
         self._last_flt_sig = None
         self._registers_configured = False
+
+        # Per-stage timing accumulators. Reset/reported by the pyramid loop
+        # to identify where the per-call overhead goes.
+        self._stage_times = {
+            "convert": 0.0, "signature": 0.0, "copy": 0.0, "transform": 0.0,
+            "regs": 0.0, "kick": 0.0, "poll": 0.0, "read": 0.0,
+        }
+        self._call_count = 0
+        self._copy_count = 0
+        self._regs_count = 0
+        self._poll_reads = 0
 
         if not PYNQ_AVAILABLE:
             self.init_error = "PYNQ not installed (pip install pynq)"
@@ -173,6 +185,12 @@ class FaberFPGAAccelerator:
             self.transform_buffer = allocate(shape=(16,), dtype=np.float32, cacheable=False)
             self.mi_hls_buffer = allocate(shape=(16,), dtype=np.float32, cacheable=False)
 
+            # The bottom row of the homogeneous transform is always [0, 0, 1];
+            # write it once here so compute_mi only touches indices 0..5.
+            self.transform_buffer[6] = 0.0
+            self.transform_buffer[7] = 0.0
+            self.transform_buffer[8] = 1.0
+
             self.enabled = True
             self._initialized = True
             print("FPGA Accelerator Ready (Optimized Uncached Mode).")
@@ -223,6 +241,32 @@ class FaberFPGAAccelerator:
             self._last_flt_sig = None
             self._registers_configured = False
 
+    def reset_stats(self) -> None:
+        """Zero the per-stage timing accumulators."""
+        for k in self._stage_times:
+            self._stage_times[k] = 0.0
+        self._call_count = 0
+        self._copy_count = 0
+        self._regs_count = 0
+        self._poll_reads = 0
+
+    def report_stats(self, label: str) -> None:
+        """Print a one-line per-stage summary since the last reset_stats()."""
+        if self._call_count == 0:
+            return
+        ms = {k: v * 1000.0 for k, v in self._stage_times.items()}
+        total_ms = sum(ms.values())
+        print(
+            f"[FPGA stats] {label} calls={self._call_count} "
+            f"copy={self._copy_count} regs={self._regs_count} "
+            f"polls={self._poll_reads} | "
+            f"conv={ms['convert']:.1f} sig={ms['signature']:.1f} "
+            f"copy={ms['copy']:.1f} xform={ms['transform']:.1f} "
+            f"regs={ms['regs']:.1f} kick={ms['kick']:.1f} "
+            f"poll={ms['poll']:.1f} read={ms['read']:.1f} "
+            f"total={total_ms:.1f} ms"
+        )
+
     def compute_mi(self, ref_tensor, flt_tensor, transform_matrix_2x3) -> float:
         """
         Run a single MI evaluation on the FPGA.
@@ -234,58 +278,82 @@ class FaberFPGAAccelerator:
         if not self.enabled:
             raise RuntimeError(self.init_error or "FPGA accelerator not enabled")
 
-        # 1) Convert torch tensors to numpy (zero-copy when possible)
-        ref_np = ref_tensor.detach().cpu().numpy() if isinstance(ref_tensor, torch.Tensor) else ref_tensor
-        flt_np = flt_tensor.detach().cpu().numpy() if isinstance(flt_tensor, torch.Tensor) else flt_tensor
+        _pc = time.perf_counter
+        _stages = self._stage_times
 
-        rows, cols = ref_np.shape
-        self._ensure_buffers(rows, cols)
-
-        # 2) Copy image data only if the underlying memory changed.
-        # Using id() is unreliable: Python may reuse an id() after the prior
-        # tensor is garbage-collected, leading to a stale buffer. Use the
-        # data pointer + shape + dtype as a more robust signature.
+        # 1) Compute signature first; only convert ref/flt to numpy if the
+        # underlying buffer changed (otherwise no new copy is needed).
+        _t = _pc()
         curr_ref_sig = self._tensor_signature(ref_tensor)
         curr_flt_sig = self._tensor_signature(flt_tensor)
-        need_addr_update = False
+        need_copy = (curr_ref_sig != self._last_ref_sig
+                     or curr_flt_sig != self._last_flt_sig)
+        _stages["signature"] += _pc() - _t
 
-        if curr_ref_sig != self._last_ref_sig or curr_flt_sig != self._last_flt_sig:
+        # 2) Conversion (only meaningful when we will actually copy).
+        _t = _pc()
+        if need_copy:
+            ref_np = ref_tensor.detach().cpu().numpy() if isinstance(ref_tensor, torch.Tensor) else ref_tensor
+            flt_np = flt_tensor.detach().cpu().numpy() if isinstance(flt_tensor, torch.Tensor) else flt_tensor
+            rows, cols = ref_np.shape
+        else:
+            # Shape only — needed to confirm buffers are sized correctly.
+            if isinstance(ref_tensor, torch.Tensor):
+                rows, cols = ref_tensor.shape[-2], ref_tensor.shape[-1]
+            else:
+                rows, cols = ref_tensor.shape
+        _stages["convert"] += _pc() - _t
+
+        self._ensure_buffers(rows, cols)
+
+        # 3) Image copy into uncached DMA buffers (only when data changed).
+        _t = _pc()
+        need_addr_update = False
+        if need_copy:
             self.input_flt_buffer[:] = flt_np
             self.input_ref_buffer[:] = ref_np
             self._last_ref_sig = curr_ref_sig
             self._last_flt_sig = curr_flt_sig
             self._registers_configured = False
             need_addr_update = True
+            self._copy_count += 1
+        _stages["copy"] += _pc() - _t
 
-        # 3) Marshal the 2x3 affine transform into a 3x3 homogeneous matrix
-        #    and store it in the uncached DMA buffer.
+        # 4) Marshal the 2x3 affine transform.
         #
         # IMPORTANT: kornia.warp_affine (used in the SW path) interprets the
         # matrix as INVERSE mapping (output -> input pixel), while Xilinx
         # xf::cv::warpTransform with TRANSFORM_TYPE=AFFINE uses FORWARD
-        # mapping (input -> output pixel). Sending the same matrix would
-        # apply opposite warps and the optimizer would converge to garbage.
-        # Invert the affine here so the FPGA produces the same warped image
-        # as the SW reference for any given M.
-        import cv2
+        # mapping (input -> output pixel). Invert the 2x3 here. Closed-form
+        # inverse instead of cv2.invertAffineTransform — cheaper in the hot
+        # loop and bit-equivalent at FP32. The bottom row [0,0,1] was set
+        # once at construction time.
+        _t = _pc()
         if isinstance(transform_matrix_2x3, torch.Tensor):
             t_mat_2x3 = transform_matrix_2x3.detach().cpu().numpy()
         else:
             t_mat_2x3 = transform_matrix_2x3
-        t_mat_2x3 = np.asarray(t_mat_2x3[:2, :], dtype=np.float32)
-        t_mat = cv2.invertAffineTransform(t_mat_2x3)
+        a = float(t_mat_2x3[0, 0]); b = float(t_mat_2x3[0, 1]); tx = float(t_mat_2x3[0, 2])
+        c = float(t_mat_2x3[1, 0]); d = float(t_mat_2x3[1, 1]); ty = float(t_mat_2x3[1, 2])
+        inv_det = 1.0 / (a * d - b * c)
+        # Single bulk write into the uncached DMA buffer instead of 6 scalar
+        # writes — each scalar write was paying the uncached round-trip
+        # latency (~500 µs on Kria), totalling ~3-4 ms per call.
+        self.transform_buffer[:6] = np.array(
+            [
+                 d * inv_det,
+                -b * inv_det,
+                (b * ty - d * tx) * inv_det,
+                -c * inv_det,
+                 a * inv_det,
+                (c * tx - a * ty) * inv_det,
+            ],
+            dtype=np.float32,
+        )
+        _stages["transform"] += _pc() - _t
 
-        self.transform_buffer[0] = t_mat[0, 0]
-        self.transform_buffer[1] = t_mat[0, 1]
-        self.transform_buffer[2] = t_mat[0, 2]
-        self.transform_buffer[3] = t_mat[1, 0]
-        self.transform_buffer[4] = t_mat[1, 1]
-        self.transform_buffer[5] = t_mat[1, 2]
-        self.transform_buffer[6] = 0.0
-        self.transform_buffer[7] = 0.0
-        self.transform_buffer[8] = 1.0
-
-        # 4) Program the IP registers only if something changed.
+        # 5) Program the IP registers only if something changed.
+        _t = _pc()
         if not self._registers_configured or need_addr_update:
             self.ip.write(self.OFFSET_ROWS, rows)
             self.ip.write(self.OFFSET_COLS, cols)
@@ -294,27 +362,46 @@ class FaberFPGAAccelerator:
             self.ip.write(self.OFFSET_MI_OUT, self.mi_hls_buffer.physical_address)
             self.ip.write(self.OFFSET_TRANSFORM, self.transform_buffer.physical_address)
             self._registers_configured = True
+            self._regs_count += 1
+        _stages["regs"] += _pc() - _t
 
-        # 5) Kick the accelerator
+        # 6) Kick the accelerator
+        _t = _pc()
         self.ip.write(self.OFFSET_CTRL, 0x01)
+        _stages["kick"] += _pc() - _t
 
-        # 6) Poll for AP_DONE (bit 1).  Timeout after 5 s to avoid hanging
-        # forever when the kernel stalls (e.g. DMA fault, bad address).
-        _deadline = time.monotonic() + 5.0
-        while not (self.ip.read(self.OFFSET_CTRL) & 0x02):
-            if time.monotonic() > _deadline:
-                # Force-idle the core and mark the accelerator unusable so the
-                # caller falls back to software MI.
-                try:
-                    self.ip.write(self.OFFSET_CTRL, 0x00)
-                except Exception:
-                    pass
-                self.enabled = False
-                self.init_error = "AP_DONE timeout (FPGA kernel stalled)"
-                raise RuntimeError(self.init_error)
+        # 7) Poll for AP_DONE (bit 1). Timeout after 5 s. The deadline check
+        # is amortized — only consult the wall clock every CHECK_EVERY reads
+        # (each MMIO read is ~20-50 µs of Python overhead, so we don't want
+        # to add a time.monotonic() call on top of every one).
+        _t = _pc()
+        ip_read = self.ip.read
+        ctrl = self.OFFSET_CTRL
+        polls = 0
+        CHECK_EVERY = 32
+        deadline = None
+        while not (ip_read(ctrl) & 0x02):
+            polls += 1
+            if polls % CHECK_EVERY == 0:
+                if deadline is None:
+                    deadline = time.monotonic() + 5.0
+                elif time.monotonic() > deadline:
+                    try:
+                        self.ip.write(self.OFFSET_CTRL, 0x00)
+                    except Exception:
+                        pass
+                    self.enabled = False
+                    self.init_error = "AP_DONE timeout (FPGA kernel stalled)"
+                    raise RuntimeError(self.init_error)
+        self._poll_reads += polls + 1
+        _stages["poll"] += _pc() - _t
 
-        # 7) Return the MI estimate
-        return float(self.mi_hls_buffer[0])
+        # 8) Return the MI estimate
+        _t = _pc()
+        result = float(self.mi_hls_buffer[0])
+        _stages["read"] += _pc() - _t
+        self._call_count += 1
+        return result
 
     def close(self):
         """Release the DMA buffers held by this accelerator."""

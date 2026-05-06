@@ -337,6 +337,13 @@ class InstrumentedMetric(EtnaMultiMetric):
         self._current_level = -1
         self._current_level_size = 0
         self._last_level_size = -1
+        # Per-level cumulative timings of the post-processing path inside
+        # _compute_metric_instrumented (everything after the base metric
+        # call: t_mat numpy copy, value sync, RMSE, queue put).
+        self._instr_times = {
+            "to_numpy": 0.0, "value_sync": 0.0, "rmse": 0.0, "emit": 0.0,
+        }
+        self._instr_calls = 0
         # Ground-truth probe landmarks in ``ref_size`` coordinates and the GT
         # affine rescaled to the same grid (both may be None).
         self._lm_mov = landmarks_mov_scaled
@@ -350,9 +357,10 @@ class InstrumentedMetric(EtnaMultiMetric):
         self._current_level_size = level_size
 
     def _compute_metric_instrumented(self, ref_img, flt_img, t_mat, eref):
-        _t0 = time.perf_counter()
+        _pc = time.perf_counter
+        _t0 = _pc()
         value = self._base_compute_metric(ref_img, flt_img, t_mat, eref)
-        step_ms = (time.perf_counter() - _t0) * 1000.0
+        step_ms = (_pc() - _t0) * 1000.0
 
         if self._event_queue is None:
             return value
@@ -373,25 +381,32 @@ class InstrumentedMetric(EtnaMultiMetric):
             ))
             self._last_level_size = level_size
 
+        _t = _pc()
         try:
             t_np = t_mat.detach().cpu().numpy().copy() if hasattr(t_mat, "detach") \
                 else np.asarray(t_mat).copy()
         except Exception:
             t_np = None
+        self._instr_times["to_numpy"] += _pc() - _t
 
+        _t = _pc()
         try:
             val_f = float(value.detach().cpu().item()) if hasattr(value, "detach") \
                 else float(value)
         except Exception:
             val_f = float("nan")
+        self._instr_times["value_sync"] += _pc() - _t
 
+        _t = _pc()
         rmse = None
         if t_np is not None and self._lm_mov is not None and self._T_gt_ref is not None:
             rmse = _compute_landmark_rmse(
                 t_np, level_size, self.ref_size,
                 self._lm_mov, self._T_gt_ref,
             )
+        self._instr_times["rmse"] += _pc() - _t
 
+        _t = _pc()
         self._eval_idx += 1
         self._emit(MetricEvent(
             level=self._infer_level(level_size),
@@ -403,7 +418,26 @@ class InstrumentedMetric(EtnaMultiMetric):
             step_ms=step_ms,
             rmse_px=rmse,
         ))
+        self._instr_times["emit"] += _pc() - _t
+        self._instr_calls += 1
         return value
+
+    def instr_reset_stats(self) -> None:
+        for k in self._instr_times:
+            self._instr_times[k] = 0.0
+        self._instr_calls = 0
+
+    def instr_report_stats(self, label: str) -> None:
+        if self._instr_calls == 0:
+            return
+        ms = {k: v * 1000.0 for k, v in self._instr_times.items()}
+        total = sum(ms.values())
+        print(
+            f"[Instr stats] {label} calls={self._instr_calls} | "
+            f"to_numpy={ms['to_numpy']:.1f} value_sync={ms['value_sync']:.1f} "
+            f"rmse={ms['rmse']:.1f} emit={ms['emit']:.1f} "
+            f"total={total:.1f} ms"
+        )
 
     def _infer_level(self, level_size: int) -> int:
         """Infer pyramid level index (0 = finest) from the current ref size.

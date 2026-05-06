@@ -114,6 +114,7 @@ class ImagePyramid:
         self.scale_factor = scale_factor
         self.device = device
 
+        self._t_start = time.perf_counter()
         self.image_float = image.float() if image.dtype == torch.uint8 else image
         self.pyramid = self._build_pyramid(self.image_float)
 
@@ -133,10 +134,14 @@ class ImagePyramid:
         g /= g.sum()
         kernel_2d = g.unsqueeze(1) @ g.unsqueeze(0)
         kernel = kernel_2d.unsqueeze(0).unsqueeze(0).to(self.device)
+        _t_kernel = time.perf_counter()
+        _per_level_ms = []
 
         for i in range(1, self.levels):
+            _t = time.perf_counter()
             if current.shape[-1] < 2 or current.shape[-2] < 2:
                 pyramid.append(pyramid[-1])
+                _per_level_ms.append((tuple(current.shape[-2:]), 0.0))
                 continue
 
             blurred = torch.nn.functional.conv2d(current, kernel, padding=kernel_size // 2)
@@ -145,7 +150,12 @@ class ImagePyramid:
             )
             pyramid.append(downsampled.squeeze().byte())
             current = downsampled
+            _per_level_ms.append((tuple(current.shape[-2:]),
+                                  (time.perf_counter() - _t) * 1000.0))
 
+        kernel_ms = (_t_kernel - getattr(self, "_t_start", _t_kernel)) * 1000.0
+        breakdown = ", ".join(f"{sz}={ms:.1f}ms" for sz, ms in _per_level_ms)
+        print(f"[Pyramid build] kernel={kernel_ms:.1f}ms levels: {breakdown}")
         return pyramid
 
     def get_level(self, level: int) -> torch.Tensor:
@@ -382,6 +392,38 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
 
     def __init__(self):
         super().__init__()
+        # Per-level cumulative timings of the optimizer hot path. Reset by
+        # compute() at the start of every pyramid level.
+        self._opt_times = {
+            "powell_total": 0.0,
+            "goldsearch_total": 0.0,
+            "evaluate_at": 0.0,
+        }
+        self._opt_counts = {
+            "goldsearch_calls": 0,
+            "evaluate_at_calls": 0,
+        }
+
+    def _opt_reset_stats(self) -> None:
+        for k in self._opt_times:
+            self._opt_times[k] = 0.0
+        for k in self._opt_counts:
+            self._opt_counts[k] = 0
+
+    def _opt_report_stats(self, label: str) -> None:
+        ms = {k: v * 1000.0 for k, v in self._opt_times.items()}
+        gs_overhead = ms["goldsearch_total"] - ms["evaluate_at"]
+        powell_overhead = ms["powell_total"] - ms["goldsearch_total"]
+        print(
+            f"[Opt stats] {label} "
+            f"powell={ms['powell_total']:.1f}ms "
+            f"(loop_overhead={powell_overhead:.1f}ms) "
+            f"goldsearch={self._opt_counts['goldsearch_calls']}/"
+            f"{ms['goldsearch_total']:.1f}ms "
+            f"(loop_overhead={gs_overhead:.1f}ms) "
+            f"evaluate_at={self._opt_counts['evaluate_at_calls']}/"
+            f"{ms['evaluate_at']:.1f}ms"
+        )
 
     def compute_from_files(self, CT, PET, name, curr_res, t_id, patient_id, metric_component, image_dimension, use_pyramid=True):
         results = []
@@ -416,10 +458,29 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         level_transforms = {}
         prev_level = None
 
+        # FPGA per-stage profiling: reset/report once per pyramid level so we
+        # can see where time goes inside compute_mi without flooding stdout.
+        fpga_accel = getattr(metric_component, "fpga_accel", None)
+        fpga_active = (
+            fpga_accel is not None
+            and getattr(metric_component, "use_fpga", False)
+            and hasattr(fpga_accel, "reset_stats")
+        )
+        metric_active = hasattr(metric_component, "metric_reset_stats")
+        instr_active = hasattr(metric_component, "instr_reset_stats")
+
         for idx, level in enumerate(ordered_levels):
             level_start = time.time()
             ref_level = ref_pyramid.get_level(level)
             flt_level = flt_pyramid.get_level(level)
+
+            if fpga_active:
+                fpga_accel.reset_stats()
+            if metric_active:
+                metric_component.metric_reset_stats()
+            if instr_active:
+                metric_component.instr_reset_stats()
+            self._opt_reset_stats()
 
             # Seed initial guess: moments at the coarsest level, upscaled
             # previous transform at the finer levels.
@@ -438,6 +499,14 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
             )
             level_transforms[level] = H_level.cpu().numpy()
             prev_level = level
+
+            if fpga_active:
+                fpga_accel.report_stats(f"Level {level}")
+            if metric_active:
+                metric_component.metric_report_stats(f"Level {level}")
+            if instr_active:
+                metric_component.instr_report_stats(f"Level {level}")
+            self._opt_report_stats(f"Level {level}")
 
             print(f"[Pyramid] Level {level} (size {tuple(ref_level.shape)}) time: {time.time() - level_start:.4f}s")
 
@@ -478,11 +547,13 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         Ref_uint8_ravel = Ref_uint8.ravel().double()
         eref = metric_component.precompute_metric(Ref_uint8_ravel)
 
+        _t_powell = time.perf_counter()
         optimal_params = self.optimize_powell_adaptive(
             rng, pa, Ref_uint8, Flt_uint8, metric_component, eref, level,
             max_iterations_override=max_iterations_override,
             max_level=max_level,
         )
+        self._opt_times["powell_total"] += time.perf_counter() - _t_powell
 
         params_trans = metric_component.to_matrix_blocked(optimal_params)
         flt_transform = metric_component.transform(Flt_uint8, params_trans)
@@ -553,12 +624,15 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
                 cur_par = par_lin[param_idx]
                 cur_rng = rng[param_idx]
 
+                _t_gs = time.perf_counter()
                 param_opt, cur_mi = self.optimize_goldsearch_adaptive(
                     cur_par, cur_rng, ref_sup_2D, flt_sup,
                     par_lin, param_idx, metric_component, eref, level,
                     max_level=max_level,
                     baseline_mi=best_metric,
                 )
+                self._opt_times["goldsearch_total"] += time.perf_counter() - _t_gs
+                self._opt_counts["goldsearch_calls"] += 1
 
                 if cur_mi < best_metric:
                     par_lin[param_idx] = param_opt
@@ -604,22 +678,45 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
             max_it, metric_tol, flat_patience_limit, range_multiplier = 20, 0.0002, 3, 1.0
 
         ratio_1, ratio_2 = 0.382, 0.618
-        start = par - ratio_1 * rng * range_multiplier
-        end = par + ratio_2 * rng * range_multiplier
+
+        # Convert torch 0-d scalars to Python floats once. All loop arithmetic
+        # then runs as Python float ops (sub-µs each); the previous version
+        # paid ~5 ms per torch op on 0-d tensors and the loop did dozens of
+        # them per sweep. FP64 is preserved end-to-end.
+        par_f = par.item() if isinstance(par, torch.Tensor) else float(par)
+        rng_f = rng.item() if isinstance(rng, torch.Tensor) else float(rng)
+        threshold = float(threshold)
+
+        start = par_f - ratio_1 * rng_f * range_multiplier
+        end = par_f + ratio_2 * rng_f * range_multiplier
 
         if abs(end - start) < threshold:
-            return par, float('inf')
+            return par_f, float('inf')
+
+        _opt_times = self._opt_times
+        _opt_counts = self._opt_counts
+        _pc = time.perf_counter
 
         def evaluate_at(point):
+            _t = _pc()
             linear_par[i] = point
             matrix = metric_component.to_matrix_blocked(linear_par)
-            return metric_component.compute_metric(ref_sup_2D, flt_sup, matrix, eref)
+            value = metric_component.compute_metric(ref_sup_2D, flt_sup, matrix, eref)
+            # compute_metric now returns Python float; keep this guard so a
+            # legacy torch tensor (CC/MSE paths) still works.
+            if isinstance(value, torch.Tensor):
+                value = float(value.item())
+            _opt_times["evaluate_at"] += _pc() - _t
+            _opt_counts["evaluate_at_calls"] += 1
+            return value
 
         # Anchor metric at the seed — anti-drift baseline. Skip the evaluation
         # when Powell already supplied the value (best_metric at the current
         # par_lin state == baseline at par for this axis).
         if baseline_mi is None:
-            baseline_mi = evaluate_at(par)
+            baseline_mi = evaluate_at(par_f)
+        elif isinstance(baseline_mi, torch.Tensor):
+            baseline_mi = float(baseline_mi.item())
 
         c = end - ratio_2 * (end - start)
         d = start + ratio_2 * (end - start)
@@ -631,7 +728,9 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         best_historic_mi = baseline_mi
 
         while abs(end - start) > threshold and it < max_it:
-            current_iter_min = min(mi_c, mi_d)
+            # Use a manual ternary instead of min() to dodge any chance of
+            # Python falling back to __lt__/__le__ on stray tensor objects.
+            current_iter_min = mi_c if mi_c < mi_d else mi_d
 
             if current_iter_min < best_historic_mi - metric_tol:
                 best_historic_mi = current_iter_min
@@ -653,8 +752,12 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
 
             it += 1
 
-        final_best_mi = min(mi_c, mi_d)
-        final_best_param = c if mi_c < mi_d else d
+        if mi_c < mi_d:
+            final_best_mi = mi_c
+            final_best_param = c
+        else:
+            final_best_mi = mi_d
+            final_best_param = d
 
         # Anti-drift: only commit the new parameter if it strictly beats the
         # value seen at the seed. Otherwise restore the seed to avoid drift
@@ -662,8 +765,8 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         if final_best_mi < baseline_mi:
             linear_par[i] = final_best_param
             return final_best_param, final_best_mi
-        linear_par[i] = par
-        return par, baseline_mi
+        linear_par[i] = par_f
+        return par_f, baseline_mi
 
     def register_images(self, Ref_uint8, Flt_uint8, metric_component):
         return self.register_images_adaptive(Ref_uint8, Flt_uint8, metric_component)
