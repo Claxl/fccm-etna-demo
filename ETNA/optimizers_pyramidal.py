@@ -392,6 +392,38 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
 
     def __init__(self):
         super().__init__()
+        # Per-level cumulative timings of the optimizer hot path. Reset by
+        # compute() at the start of every pyramid level.
+        self._opt_times = {
+            "powell_total": 0.0,
+            "goldsearch_total": 0.0,
+            "evaluate_at": 0.0,
+        }
+        self._opt_counts = {
+            "goldsearch_calls": 0,
+            "evaluate_at_calls": 0,
+        }
+
+    def _opt_reset_stats(self) -> None:
+        for k in self._opt_times:
+            self._opt_times[k] = 0.0
+        for k in self._opt_counts:
+            self._opt_counts[k] = 0
+
+    def _opt_report_stats(self, label: str) -> None:
+        ms = {k: v * 1000.0 for k, v in self._opt_times.items()}
+        gs_overhead = ms["goldsearch_total"] - ms["evaluate_at"]
+        powell_overhead = ms["powell_total"] - ms["goldsearch_total"]
+        print(
+            f"[Opt stats] {label} "
+            f"powell={ms['powell_total']:.1f}ms "
+            f"(loop_overhead={powell_overhead:.1f}ms) "
+            f"goldsearch={self._opt_counts['goldsearch_calls']}/"
+            f"{ms['goldsearch_total']:.1f}ms "
+            f"(loop_overhead={gs_overhead:.1f}ms) "
+            f"evaluate_at={self._opt_counts['evaluate_at_calls']}/"
+            f"{ms['evaluate_at']:.1f}ms"
+        )
 
     def compute_from_files(self, CT, PET, name, curr_res, t_id, patient_id, metric_component, image_dimension, use_pyramid=True):
         results = []
@@ -448,6 +480,7 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
                 metric_component.metric_reset_stats()
             if instr_active:
                 metric_component.instr_reset_stats()
+            self._opt_reset_stats()
 
             # Seed initial guess: moments at the coarsest level, upscaled
             # previous transform at the finer levels.
@@ -473,6 +506,7 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
                 metric_component.metric_report_stats(f"Level {level}")
             if instr_active:
                 metric_component.instr_report_stats(f"Level {level}")
+            self._opt_report_stats(f"Level {level}")
 
             print(f"[Pyramid] Level {level} (size {tuple(ref_level.shape)}) time: {time.time() - level_start:.4f}s")
 
@@ -513,11 +547,13 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         Ref_uint8_ravel = Ref_uint8.ravel().double()
         eref = metric_component.precompute_metric(Ref_uint8_ravel)
 
+        _t_powell = time.perf_counter()
         optimal_params = self.optimize_powell_adaptive(
             rng, pa, Ref_uint8, Flt_uint8, metric_component, eref, level,
             max_iterations_override=max_iterations_override,
             max_level=max_level,
         )
+        self._opt_times["powell_total"] += time.perf_counter() - _t_powell
 
         params_trans = metric_component.to_matrix_blocked(optimal_params)
         flt_transform = metric_component.transform(Flt_uint8, params_trans)
@@ -588,12 +624,15 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
                 cur_par = par_lin[param_idx]
                 cur_rng = rng[param_idx]
 
+                _t_gs = time.perf_counter()
                 param_opt, cur_mi = self.optimize_goldsearch_adaptive(
                     cur_par, cur_rng, ref_sup_2D, flt_sup,
                     par_lin, param_idx, metric_component, eref, level,
                     max_level=max_level,
                     baseline_mi=best_metric,
                 )
+                self._opt_times["goldsearch_total"] += time.perf_counter() - _t_gs
+                self._opt_counts["goldsearch_calls"] += 1
 
                 if cur_mi < best_metric:
                     par_lin[param_idx] = param_opt
@@ -645,10 +684,18 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         if abs(end - start) < threshold:
             return par, float('inf')
 
+        _opt_times = self._opt_times
+        _opt_counts = self._opt_counts
+        _pc = time.perf_counter
+
         def evaluate_at(point):
+            _t = _pc()
             linear_par[i] = point
             matrix = metric_component.to_matrix_blocked(linear_par)
-            return metric_component.compute_metric(ref_sup_2D, flt_sup, matrix, eref)
+            value = metric_component.compute_metric(ref_sup_2D, flt_sup, matrix, eref)
+            _opt_times["evaluate_at"] += _pc() - _t
+            _opt_counts["evaluate_at_calls"] += 1
+            return value
 
         # Anchor metric at the seed — anti-drift baseline. Skip the evaluation
         # when Powell already supplied the value (best_metric at the current
