@@ -251,10 +251,15 @@ class EtnaMultiMetric(object):
         mi = self.compute_mi(ref_img, flt_img, t_mat, eref)
         _t = time.perf_counter()
         # math.exp on a Python float — was torch.exp(0-d).cpu() (~5 ms/call).
-        # Monotone, FP64 bit-equivalent.
+        # The original path stored values in float32 (torch.tensor default
+        # dtype + torch.exp on a float32 tensor), so the optimizer compared
+        # FP32-precision metrics. Cast back to float32 here to keep the same
+        # comparison precision: in pure-FP64 the optimizer can distinguish
+        # values that differ below the float32 ULP and ends up on a slightly
+        # different (worse) trajectory.
         if isinstance(mi, torch.Tensor):
             mi = float(mi.item())
-        result = math.exp(mi)
+        result = float(np.float32(math.exp(mi)))
         self._wrap_times["compute_mi_exp"] += time.perf_counter() - _t
         self._wrap_counts["compute_mi_exp"] += 1
         return result
