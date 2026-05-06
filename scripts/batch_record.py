@@ -50,28 +50,34 @@ def _scan_pairs() -> dict[str, dict]:
     pairs: dict[str, dict] = {}
     img_exts = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 
-    for fixed in sorted(_IMAGES.glob("*_fixed.*")):
+    for fixed in sorted(_IMAGES.glob("**/*_fixed.*")):
         if fixed.suffix.lower() not in img_exts:
             continue
         stem = fixed.stem[: -len("_fixed")]
+        rel_dir = fixed.parent.relative_to(_IMAGES)
+        pair_key = str(rel_dir / stem) if str(rel_dir) != "." else stem
         for ext in img_exts:
-            moving = _IMAGES / f"{stem}_moving{ext}"
+            moving = fixed.parent / f"{stem}_moving{ext}"
             if moving.exists():
-                gt = _IMAGES / f"{stem}.mat"
-                pairs[stem] = {"fixed": fixed, "moving": moving,
-                               "gt": gt if gt.exists() else None}
+                gt = fixed.parent / f"{stem}.mat"
+                pairs[pair_key] = {"fixed": fixed, "moving": moving,
+                                   "gt": gt if gt.exists() else None}
                 break
 
     sb_tags = ("CS", "DN", "DO", "IO", "MO", "OO", "SO")
-    for mat in sorted(_IMAGES.glob("*.mat")):
+    for mat in sorted(_IMAGES.glob("**/*.mat")):
         stem = mat.stem
-        if len(stem) < 3 or stem[:2].upper() not in sb_tags or stem in pairs:
+        if len(stem) < 3 or stem[:2].upper() not in sb_tags:
+            continue
+        rel_dir = mat.parent.relative_to(_IMAGES)
+        pair_key = str(rel_dir / stem) if str(rel_dir) != "." else stem
+        if pair_key in pairs:
             continue
         for ext in img_exts:
-            cand_m = _IMAGES / f"{stem}a{ext}"
-            cand_f = _IMAGES / f"{stem}b{ext}"
+            cand_m = mat.parent / f"{stem}a{ext}"
+            cand_f = mat.parent / f"{stem}b{ext}"
             if cand_m.exists() and cand_f.exists():
-                pairs[stem] = {"fixed": cand_f, "moving": cand_m, "gt": mat}
+                pairs[pair_key] = {"fixed": cand_f, "moving": cand_m, "gt": mat}
                 break
 
     return pairs

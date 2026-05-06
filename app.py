@@ -121,15 +121,17 @@ def _scan_pairs() -> dict[str, dict]:
     img_exts = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 
     # Convention 1: <name>_fixed / <name>_moving (+ optional <name>.mat).
-    for fixed in sorted(IMAGES_DIR.glob("*_fixed.*")):
+    for fixed in sorted(IMAGES_DIR.glob("**/*_fixed.*")):
         if fixed.suffix.lower() not in img_exts:
             continue
         stem = fixed.stem[:-len("_fixed")]
+        rel_dir = fixed.parent.relative_to(IMAGES_DIR)
+        pair_key = str(rel_dir / stem) if str(rel_dir) != "." else stem
         for ext in img_exts:
-            moving = IMAGES_DIR / f"{stem}_moving{ext}"
+            moving = fixed.parent / f"{stem}_moving{ext}"
             if moving.exists():
-                gt = IMAGES_DIR / f"{stem}.mat"
-                pairs[stem] = {
+                gt = fixed.parent / f"{stem}.mat"
+                pairs[pair_key] = {
                     "fixed": fixed, "moving": moving,
                     "gt": gt if gt.exists() else None,
                 }
@@ -137,21 +139,23 @@ def _scan_pairs() -> dict[str, dict]:
 
     # Convention 2: STAR-Bench TAGNUMa/b + TAGNUM.mat.
     sb_tags = ("CS", "DN", "DO", "IO", "MO", "OO", "SO")
-    for mat in sorted(IMAGES_DIR.glob("*.mat")):
+    for mat in sorted(IMAGES_DIR.glob("**/*.mat")):
         stem = mat.stem
         if len(stem) < 3 or stem[:2].upper() not in sb_tags:
             continue
-        if stem in pairs:
+        rel_dir = mat.parent.relative_to(IMAGES_DIR)
+        pair_key = str(rel_dir / stem) if str(rel_dir) != "." else stem
+        if pair_key in pairs:
             continue
         moving = fixed = None
         for ext in img_exts:
-            cand_m = IMAGES_DIR / f"{stem}a{ext}"
-            cand_f = IMAGES_DIR / f"{stem}b{ext}"
+            cand_m = mat.parent / f"{stem}a{ext}"
+            cand_f = mat.parent / f"{stem}b{ext}"
             if cand_m.exists() and cand_f.exists():
                 moving, fixed = cand_m, cand_f
                 break
         if fixed and moving:
-            pairs[stem] = {"fixed": fixed, "moving": moving, "gt": mat}
+            pairs[pair_key] = {"fixed": fixed, "moving": moving, "gt": mat}
 
     return pairs
 
@@ -178,7 +182,8 @@ with st.sidebar:
                                  index=0, format_func=_fmt)
         if pair_name is not None:
             if pairs[pair_name].get("gt"):
-                st.caption(f"⭐ ground truth: `{pairs[pair_name]['gt'].name}`")
+                gt_rel = pairs[pair_name]['gt'].relative_to(IMAGES_DIR)
+                st.caption(f"⭐ ground truth: `{gt_rel}`")
             else:
                 st.caption("no .mat found — MI-only mode")
 
