@@ -678,11 +678,20 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
             max_it, metric_tol, flat_patience_limit, range_multiplier = 20, 0.0002, 3, 1.0
 
         ratio_1, ratio_2 = 0.382, 0.618
-        start = par - ratio_1 * rng * range_multiplier
-        end = par + ratio_2 * rng * range_multiplier
+
+        # Convert torch 0-d scalars to Python floats once. All loop arithmetic
+        # then runs as Python float ops (sub-µs each); the previous version
+        # paid ~5 ms per torch op on 0-d tensors and the loop did dozens of
+        # them per sweep. FP64 is preserved end-to-end.
+        par_f = par.item() if isinstance(par, torch.Tensor) else float(par)
+        rng_f = rng.item() if isinstance(rng, torch.Tensor) else float(rng)
+        threshold = float(threshold)
+
+        start = par_f - ratio_1 * rng_f * range_multiplier
+        end = par_f + ratio_2 * rng_f * range_multiplier
 
         if abs(end - start) < threshold:
-            return par, float('inf')
+            return par_f, float('inf')
 
         _opt_times = self._opt_times
         _opt_counts = self._opt_counts
@@ -693,6 +702,10 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
             linear_par[i] = point
             matrix = metric_component.to_matrix_blocked(linear_par)
             value = metric_component.compute_metric(ref_sup_2D, flt_sup, matrix, eref)
+            # compute_metric now returns Python float; keep this guard so a
+            # legacy torch tensor (CC/MSE paths) still works.
+            if isinstance(value, torch.Tensor):
+                value = float(value.item())
             _opt_times["evaluate_at"] += _pc() - _t
             _opt_counts["evaluate_at_calls"] += 1
             return value
@@ -701,7 +714,9 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         # when Powell already supplied the value (best_metric at the current
         # par_lin state == baseline at par for this axis).
         if baseline_mi is None:
-            baseline_mi = evaluate_at(par)
+            baseline_mi = evaluate_at(par_f)
+        elif isinstance(baseline_mi, torch.Tensor):
+            baseline_mi = float(baseline_mi.item())
 
         c = end - ratio_2 * (end - start)
         d = start + ratio_2 * (end - start)
@@ -713,7 +728,9 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         best_historic_mi = baseline_mi
 
         while abs(end - start) > threshold and it < max_it:
-            current_iter_min = min(mi_c, mi_d)
+            # Use a manual ternary instead of min() to dodge any chance of
+            # Python falling back to __lt__/__le__ on stray tensor objects.
+            current_iter_min = mi_c if mi_c < mi_d else mi_d
 
             if current_iter_min < best_historic_mi - metric_tol:
                 best_historic_mi = current_iter_min
@@ -735,8 +752,12 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
 
             it += 1
 
-        final_best_mi = min(mi_c, mi_d)
-        final_best_param = c if mi_c < mi_d else d
+        if mi_c < mi_d:
+            final_best_mi = mi_c
+            final_best_param = c
+        else:
+            final_best_mi = mi_d
+            final_best_param = d
 
         # Anti-drift: only commit the new parameter if it strictly beats the
         # value seen at the seed. Otherwise restore the seed to avoid drift
@@ -744,8 +765,8 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         if final_best_mi < baseline_mi:
             linear_par[i] = final_best_param
             return final_best_param, final_best_mi
-        linear_par[i] = par
-        return par, baseline_mi
+        linear_par[i] = par_f
+        return par_f, baseline_mi
 
     def register_images(self, Ref_uint8, Flt_uint8, metric_component):
         return self.register_images_adaptive(Ref_uint8, Flt_uint8, metric_component)

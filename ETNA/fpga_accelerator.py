@@ -336,13 +336,20 @@ class FaberFPGAAccelerator:
         a = float(t_mat_2x3[0, 0]); b = float(t_mat_2x3[0, 1]); tx = float(t_mat_2x3[0, 2])
         c = float(t_mat_2x3[1, 0]); d = float(t_mat_2x3[1, 1]); ty = float(t_mat_2x3[1, 2])
         inv_det = 1.0 / (a * d - b * c)
-        buf = self.transform_buffer
-        buf[0] =  d * inv_det
-        buf[1] = -b * inv_det
-        buf[2] = (b * ty - d * tx) * inv_det
-        buf[3] = -c * inv_det
-        buf[4] =  a * inv_det
-        buf[5] = (c * tx - a * ty) * inv_det
+        # Single bulk write into the uncached DMA buffer instead of 6 scalar
+        # writes — each scalar write was paying the uncached round-trip
+        # latency (~500 µs on Kria), totalling ~3-4 ms per call.
+        self.transform_buffer[:6] = np.array(
+            [
+                 d * inv_det,
+                -b * inv_det,
+                (b * ty - d * tx) * inv_det,
+                -c * inv_det,
+                 a * inv_det,
+                (c * tx - a * ty) * inv_det,
+            ],
+            dtype=np.float32,
+        )
         _stages["transform"] += _pc() - _t
 
         # 5) Program the IP registers only if something changed.

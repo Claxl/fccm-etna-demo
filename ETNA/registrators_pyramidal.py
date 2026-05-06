@@ -204,14 +204,20 @@ class EtnaMultiMetric(object):
         )
 
     def compute_mi(self, ref_img, flt_img, t_mat, eref):
-        """FPGA-aware MI with software fallback. See standard variant for details."""
+        """FPGA-aware MI with software fallback. See standard variant for details.
+
+        Returns a Python float (was a torch 0-d tensor). Every torch 0-d op
+        downstream — comparisons, scalar arithmetic, setitem — costs ~5 ms
+        on ARM CPU; returning a native float lets the optimizer loop stay
+        in Python (sub-µs per op). FP64 throughout.
+        """
         _t_wrap = time.perf_counter()
         self._wrap_counts["compute_mi_wrapper"] += 1
         if self.use_fpga:
             try:
                 mi_val = self.fpga_accel.compute_mi(ref_img, flt_img, t_mat)
                 _t_post = time.perf_counter()
-                result = torch.tensor(-mi_val, device=self.device)
+                result = -float(mi_val)
                 self._wrap_times["compute_mi_post"] += time.perf_counter() - _t_post
                 self._wrap_times["compute_mi_wrapper"] += time.perf_counter() - _t_wrap
                 return result
@@ -230,20 +236,25 @@ class EtnaMultiMetric(object):
                         except Exception:
                             pass
                 flt_warped = self.transform(flt_img, t_mat)
-                result = -(self.mutual_information(ref_img.ravel(), flt_warped.ravel(), eref).cpu())
+                mi = self.mutual_information(ref_img.ravel(), flt_warped.ravel(), eref)
+                result = -float(mi.item() if isinstance(mi, torch.Tensor) else mi)
                 self._wrap_times["compute_mi_wrapper"] += time.perf_counter() - _t_wrap
                 return result
         else:
             flt_warped = self.transform(flt_img, t_mat)
             mi = self.mutual_information(ref_img.ravel(), flt_warped.ravel(), eref)
-            result = -(mi.cpu())
+            result = -float(mi.item() if isinstance(mi, torch.Tensor) else mi)
             self._wrap_times["compute_mi_wrapper"] += time.perf_counter() - _t_wrap
             return result
 
     def compute_mi_exponential(self, ref_img, flt_img, t_mat, eref):
         mi = self.compute_mi(ref_img, flt_img, t_mat, eref)
         _t = time.perf_counter()
-        result = torch.exp(mi).cpu()
+        # math.exp on a Python float — was torch.exp(0-d).cpu() (~5 ms/call).
+        # Monotone, FP64 bit-equivalent.
+        if isinstance(mi, torch.Tensor):
+            mi = float(mi.item())
+        result = math.exp(mi)
         self._wrap_times["compute_mi_exp"] += time.perf_counter() - _t
         self._wrap_counts["compute_mi_exp"] += 1
         return result
@@ -302,14 +313,22 @@ class EtnaMultiMetric(object):
         register_images_adaptive: M = [[cos θ, sin θ, tx], [-sin θ, cos θ, ty]].
         """
         _t = time.perf_counter()
-        mat_params = torch.empty((2, 3), device=self.device)
-        mat_params[0][2] = vector_params[0]
-        mat_params[1][2] = vector_params[1]
-        theta = vector_params[2]
-        mat_params[0][0] = torch.cos(theta)
-        mat_params[1][1] = torch.cos(theta)
-        mat_params[0][1] = torch.sin(theta)
-        mat_params[1][0] = -torch.sin(theta)
+        if isinstance(vector_params, torch.Tensor):
+            tx = vector_params[0].item()
+            ty = vector_params[1].item()
+            theta = vector_params[2].item()
+        else:
+            tx = float(vector_params[0])
+            ty = float(vector_params[1])
+            theta = float(vector_params[2])
+        cs = math.cos(theta)
+        sn = math.sin(theta)
+        # Single allocation in float64 — was 11 separate torch ops on 0-d
+        # tensors (~5 ms each on ARM CPU). Bit-equivalent.
+        mat_params = torch.tensor(
+            [[cs, sn, tx], [-sn, cs, ty]],
+            dtype=torch.float64, device=self.device,
+        )
         self._wrap_times["to_matrix_blocked"] += time.perf_counter() - _t
         self._wrap_counts["to_matrix_blocked"] += 1
         return mat_params
