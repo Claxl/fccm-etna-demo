@@ -323,11 +323,13 @@ class EtnaMultiMetric(object):
             theta = float(vector_params[2])
         cs = math.cos(theta)
         sn = math.sin(theta)
-        # Single allocation in float64 — was 11 separate torch ops on 0-d
-        # tensors (~5 ms each on ARM CPU). Bit-equivalent.
+        # Single allocation. Default dtype is float32 — matches the original
+        # torch.empty((2, 3)) layout (kornia.warp_affine requires float32),
+        # while the input scalars come from a float64 par_lin so the values
+        # round-trip the same way they did before.
         mat_params = torch.tensor(
             [[cs, sn, tx], [-sn, cs, ty]],
-            dtype=torch.float64, device=self.device,
+            dtype=torch.float32, device=self.device,
         )
         self._wrap_times["to_matrix_blocked"] += time.perf_counter() - _t
         self._wrap_counts["to_matrix_blocked"] += 1
