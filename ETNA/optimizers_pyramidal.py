@@ -114,6 +114,7 @@ class ImagePyramid:
         self.scale_factor = scale_factor
         self.device = device
 
+        self._t_start = time.perf_counter()
         self.image_float = image.float() if image.dtype == torch.uint8 else image
         self.pyramid = self._build_pyramid(self.image_float)
 
@@ -133,10 +134,14 @@ class ImagePyramid:
         g /= g.sum()
         kernel_2d = g.unsqueeze(1) @ g.unsqueeze(0)
         kernel = kernel_2d.unsqueeze(0).unsqueeze(0).to(self.device)
+        _t_kernel = time.perf_counter()
+        _per_level_ms = []
 
         for i in range(1, self.levels):
+            _t = time.perf_counter()
             if current.shape[-1] < 2 or current.shape[-2] < 2:
                 pyramid.append(pyramid[-1])
+                _per_level_ms.append((tuple(current.shape[-2:]), 0.0))
                 continue
 
             blurred = torch.nn.functional.conv2d(current, kernel, padding=kernel_size // 2)
@@ -145,7 +150,12 @@ class ImagePyramid:
             )
             pyramid.append(downsampled.squeeze().byte())
             current = downsampled
+            _per_level_ms.append((tuple(current.shape[-2:]),
+                                  (time.perf_counter() - _t) * 1000.0))
 
+        kernel_ms = (_t_kernel - getattr(self, "_t_start", _t_kernel)) * 1000.0
+        breakdown = ", ".join(f"{sz}={ms:.1f}ms" for sz, ms in _per_level_ms)
+        print(f"[Pyramid build] kernel={kernel_ms:.1f}ms levels: {breakdown}")
         return pyramid
 
     def get_level(self, level: int) -> torch.Tensor:
@@ -424,6 +434,8 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
             and getattr(metric_component, "use_fpga", False)
             and hasattr(fpga_accel, "reset_stats")
         )
+        metric_active = hasattr(metric_component, "metric_reset_stats")
+        instr_active = hasattr(metric_component, "instr_reset_stats")
 
         for idx, level in enumerate(ordered_levels):
             level_start = time.time()
@@ -432,6 +444,10 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
 
             if fpga_active:
                 fpga_accel.reset_stats()
+            if metric_active:
+                metric_component.metric_reset_stats()
+            if instr_active:
+                metric_component.instr_reset_stats()
 
             # Seed initial guess: moments at the coarsest level, upscaled
             # previous transform at the finer levels.
@@ -453,6 +469,10 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
 
             if fpga_active:
                 fpga_accel.report_stats(f"Level {level}")
+            if metric_active:
+                metric_component.metric_report_stats(f"Level {level}")
+            if instr_active:
+                metric_component.instr_report_stats(f"Level {level}")
 
             print(f"[Pyramid] Level {level} (size {tuple(ref_level.shape)}) time: {time.time() - level_start:.4f}s")
 

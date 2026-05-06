@@ -8,6 +8,7 @@ pyramidal code path can evolve separately from the non-pyramidal Faber
 implementation shipped as the ``faber_fpga`` submodule.
 """
 import math
+import time
 
 import numpy as np
 import torch
@@ -72,6 +73,21 @@ class EtnaMultiMetric(object):
         self.compute_metric = None
         self.precompute_metric = None
         self._hist_edges_cache: dict = {}
+
+        # Per-stage Python-side timing accumulators. Reset per pyramid level by
+        # the EtnaMultiPowell loop so we can see where the wrapper time goes
+        # between consecutive FPGA evaluations.
+        self._wrap_times = {
+            "to_matrix_blocked": 0.0,
+            "compute_mi_wrapper": 0.0,
+            "compute_mi_exp": 0.0,
+            "compute_mi_post": 0.0,
+        }
+        self._wrap_counts = {
+            "to_matrix_blocked": 0,
+            "compute_mi_wrapper": 0,
+            "compute_mi_exp": 0,
+        }
         self.ref_vals = torch.ones(ref_size * ref_size, dtype=torch.int, device=self.device)
         self.move_data = None
         self.hist_dim = 256
@@ -166,12 +182,39 @@ class EtnaMultiMetric(object):
     def mean_squared_error(self, Ref_uint8_ravel, Flt_uint8_ravel, mse_ref):
         return torch.sum((Ref_uint8_ravel - Flt_uint8_ravel) ** 2)
 
+    def metric_reset_stats(self) -> None:
+        for k in self._wrap_times:
+            self._wrap_times[k] = 0.0
+        for k in self._wrap_counts:
+            self._wrap_counts[k] = 0
+
+    def metric_report_stats(self, label: str) -> None:
+        if self._wrap_counts["compute_mi_wrapper"] == 0:
+            return
+        ms = {k: v * 1000.0 for k, v in self._wrap_times.items()}
+        print(
+            f"[Metric stats] {label} "
+            f"to_mat={self._wrap_counts['to_matrix_blocked']}/"
+            f"{ms['to_matrix_blocked']:.1f}ms "
+            f"mi_wrap={self._wrap_counts['compute_mi_wrapper']}/"
+            f"{ms['compute_mi_wrapper']:.1f}ms "
+            f"(post={ms['compute_mi_post']:.1f}ms) "
+            f"mi_exp={self._wrap_counts['compute_mi_exp']}/"
+            f"{ms['compute_mi_exp']:.1f}ms"
+        )
+
     def compute_mi(self, ref_img, flt_img, t_mat, eref):
         """FPGA-aware MI with software fallback. See standard variant for details."""
+        _t_wrap = time.perf_counter()
+        self._wrap_counts["compute_mi_wrapper"] += 1
         if self.use_fpga:
             try:
                 mi_val = self.fpga_accel.compute_mi(ref_img, flt_img, t_mat)
-                return torch.tensor(-mi_val, device=self.device)
+                _t_post = time.perf_counter()
+                result = torch.tensor(-mi_val, device=self.device)
+                self._wrap_times["compute_mi_post"] += time.perf_counter() - _t_post
+                self._wrap_times["compute_mi_wrapper"] += time.perf_counter() - _t_wrap
+                return result
             except Exception as e:
                 print(f"WARNING: FPGA Error: {e}. Fallback to SW.")
                 if not self._fpga_warned:
@@ -187,15 +230,23 @@ class EtnaMultiMetric(object):
                         except Exception:
                             pass
                 flt_warped = self.transform(flt_img, t_mat)
-                return -(self.mutual_information(ref_img.ravel(), flt_warped.ravel(), eref).cpu())
+                result = -(self.mutual_information(ref_img.ravel(), flt_warped.ravel(), eref).cpu())
+                self._wrap_times["compute_mi_wrapper"] += time.perf_counter() - _t_wrap
+                return result
         else:
             flt_warped = self.transform(flt_img, t_mat)
             mi = self.mutual_information(ref_img.ravel(), flt_warped.ravel(), eref)
-            return -(mi.cpu())
+            result = -(mi.cpu())
+            self._wrap_times["compute_mi_wrapper"] += time.perf_counter() - _t_wrap
+            return result
 
     def compute_mi_exponential(self, ref_img, flt_img, t_mat, eref):
         mi = self.compute_mi(ref_img, flt_img, t_mat, eref)
-        return torch.exp(mi).cpu()
+        _t = time.perf_counter()
+        result = torch.exp(mi).cpu()
+        self._wrap_times["compute_mi_exp"] += time.perf_counter() - _t
+        self._wrap_counts["compute_mi_exp"] += 1
+        return result
 
     def compute_cc(self, ref_img, flt_img, t_mat, cc_ref):
         flt_warped = self.transform(flt_img, t_mat)
@@ -250,6 +301,7 @@ class EtnaMultiMetric(object):
         Convention matches estimate_initial after the atan2 conversion in
         register_images_adaptive: M = [[cos θ, sin θ, tx], [-sin θ, cos θ, ty]].
         """
+        _t = time.perf_counter()
         mat_params = torch.empty((2, 3), device=self.device)
         mat_params[0][2] = vector_params[0]
         mat_params[1][2] = vector_params[1]
@@ -258,6 +310,8 @@ class EtnaMultiMetric(object):
         mat_params[1][1] = torch.cos(theta)
         mat_params[0][1] = torch.sin(theta)
         mat_params[1][0] = -torch.sin(theta)
+        self._wrap_times["to_matrix_blocked"] += time.perf_counter() - _t
+        self._wrap_counts["to_matrix_blocked"] += 1
         return mat_params
 
     def estimate_initial(self, Ref_uint8, Flt_uint8, params):
