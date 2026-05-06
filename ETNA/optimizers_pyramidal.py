@@ -416,10 +416,22 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
         level_transforms = {}
         prev_level = None
 
+        # FPGA per-stage profiling: reset/report once per pyramid level so we
+        # can see where time goes inside compute_mi without flooding stdout.
+        fpga_accel = getattr(metric_component, "fpga_accel", None)
+        fpga_active = (
+            fpga_accel is not None
+            and getattr(metric_component, "use_fpga", False)
+            and hasattr(fpga_accel, "reset_stats")
+        )
+
         for idx, level in enumerate(ordered_levels):
             level_start = time.time()
             ref_level = ref_pyramid.get_level(level)
             flt_level = flt_pyramid.get_level(level)
+
+            if fpga_active:
+                fpga_accel.reset_stats()
 
             # Seed initial guess: moments at the coarsest level, upscaled
             # previous transform at the finer levels.
@@ -438,6 +450,9 @@ class EtnaMultiPowell(EtnaMultiSwOptimizers):
             )
             level_transforms[level] = H_level.cpu().numpy()
             prev_level = level
+
+            if fpga_active:
+                fpga_accel.report_stats(f"Level {level}")
 
             print(f"[Pyramid] Level {level} (size {tuple(ref_level.shape)}) time: {time.time() - level_start:.4f}s")
 
