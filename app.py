@@ -101,6 +101,44 @@ st.markdown('<p class="etna-title">ETNA — Hybrid CPU/FPGA Pyramidal Image Regi
             unsafe_allow_html=True)
 st.markdown('<p class="etna-sub">Live demo • FCCM demo night</p>', unsafe_allow_html=True)
 
+
+KPI_TOOLTIPS = {
+    "Backend": "Compute backend currently in use (FPGA / CPU). Shows 'CPU fallback' when FPGA was requested but unavailable.",
+    "Level": "Active pyramid level and its image size in pixels. L0 is the finest (full-res) level.",
+    "Metric evals": "Number of similarity-metric evaluations performed so far across all pyramid levels.",
+    "Elapsed": "Wall-clock time elapsed since the run started.",
+    "ms / step": "Latest milliseconds spent inside a single similarity-metric evaluation.",
+    "TRE (px)": "Target Registration Error: RMSE of the ground-truth landmark positions, in pixels. Initial → best.",
+    "Power (W)": "Instantaneous FPGA power draw (PMBUS reading).",
+    "QAC": "Quality / Accuracy / Cost figure-of-merit: 100 / (best_TRE_px + power_W).",
+    "CPU Backend": "Parallel CPU run used as a baseline for FPGA speedup comparison.",
+    "CPU Level": "Active pyramid level on the parallel CPU baseline run.",
+    "CPU Evals": "Number of metric evaluations performed by the parallel CPU baseline.",
+    "CPU Elapsed": "Wall-clock time of the parallel CPU baseline run.",
+    "CPU ms/step": "Latest ms / step on the parallel CPU baseline.",
+    "CPU TRE": "Target Registration Error of the parallel CPU baseline.",
+    "CPU Power (W)": "CPU socket power consumption during the baseline run.",
+    "CPU QAC": "QAC figure-of-merit on the parallel CPU baseline.",
+}
+
+
+def render_kpi(slot, label: str, value: str, color: str = "#fff",
+               tooltip: str | None = None) -> None:
+    if tooltip is None:
+        tooltip = KPI_TOOLTIPS.get(label, "")
+    title_attr = f' title="{tooltip}"' if tooltip else ""
+    slot.markdown(
+        f'<div class="kpi-card"{title_attr}><div class="kpi-lbl">{label}</div>'
+        f'<div class="kpi-val" style="color:{color}">{value}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def hover_label(text: str, tooltip: str) -> str:
+    """Bold label with a native browser tooltip on hover (HTML title attr)."""
+    return (f'<span title="{tooltip}" style="border-bottom:1px dotted #888;'
+            f'cursor:help;"><strong>{text}</strong></span>')
+
 # ---------------------------------------------------------------------------
 # Sidebar controls
 # ---------------------------------------------------------------------------
@@ -365,44 +403,6 @@ def render_matrix(h: np.ndarray | None) -> str:
         rows.append(cells)
     body = "\n".join(rows)
     return f"<pre style='color:#fff;font-size:1.05rem'>{body}</pre>"
-
-
-KPI_TOOLTIPS = {
-    "Backend": "Compute backend currently in use (FPGA / CPU). Shows 'CPU fallback' when FPGA was requested but unavailable.",
-    "Level": "Active pyramid level and its image size in pixels. L0 is the finest (full-res) level.",
-    "Metric evals": "Number of similarity-metric evaluations performed so far across all pyramid levels.",
-    "Elapsed": "Wall-clock time elapsed since the run started.",
-    "ms / step": "Latest milliseconds spent inside a single similarity-metric evaluation.",
-    "TRE (px)": "Target Registration Error: RMSE of the ground-truth landmark positions, in pixels. Initial → best.",
-    "Power (W)": "Instantaneous FPGA power draw (PMBUS reading).",
-    "QAC": "Quality / Accuracy / Cost figure-of-merit: 100 / (best_TRE_px + power_W).",
-    "CPU Backend": "Parallel CPU run used as a baseline for FPGA speedup comparison.",
-    "CPU Level": "Active pyramid level on the parallel CPU baseline run.",
-    "CPU Evals": "Number of metric evaluations performed by the parallel CPU baseline.",
-    "CPU Elapsed": "Wall-clock time of the parallel CPU baseline run.",
-    "CPU ms/step": "Latest ms / step on the parallel CPU baseline.",
-    "CPU TRE": "Target Registration Error of the parallel CPU baseline.",
-    "CPU Power (W)": "CPU socket power consumption during the baseline run.",
-    "CPU QAC": "QAC figure-of-merit on the parallel CPU baseline.",
-}
-
-
-def render_kpi(slot, label: str, value: str, color: str = "#fff",
-               tooltip: str | None = None) -> None:
-    if tooltip is None:
-        tooltip = KPI_TOOLTIPS.get(label, "")
-    title_attr = f' title="{tooltip}"' if tooltip else ""
-    slot.markdown(
-        f'<div class="kpi-card"{title_attr}><div class="kpi-lbl">{label}</div>'
-        f'<div class="kpi-val" style="color:{color}">{value}</div></div>',
-        unsafe_allow_html=True,
-    )
-
-
-def hover_label(text: str, tooltip: str) -> str:
-    """Bold label with a native browser tooltip on hover (HTML title attr)."""
-    return (f'<span title="{tooltip}" style="border-bottom:1px dotted #888;'
-            f'cursor:help;"><strong>{text}</strong></span>')
 
 
 # Initial state for the live slots.
