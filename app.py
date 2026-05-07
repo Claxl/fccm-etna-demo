@@ -984,6 +984,19 @@ elif run_clicked:
                 # Per-landmark pixel error: ||H_est @ p - T_gt @ p||.
                 per_lm = np.linalg.norm(predicted_lm - gt_lm_on_fixed, axis=1)
 
+                # Landmark visualization image (GT in green, predicted in red).
+                err_img = draw_landmark_error(
+                    result.fixed, gt_lm_on_fixed, predicted_lm,
+                )
+                st.image(
+                    annotate(
+                        err_img,
+                        f"GT (green) vs predicted (red) - TRE {result.final_rmse_px:.2f} px",
+                        (0, 255, 0),
+                    ),
+                    channels="BGR", width="stretch",
+                )
+
                 c1, c2 = st.columns([3, 1])
                 with c1:
                     n_lm = len(per_lm)
