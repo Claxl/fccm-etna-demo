@@ -92,6 +92,52 @@ st.markdown(
     .ladder-cell { border-radius:6px; padding:10px 12px; margin:3px 0;
                    font-family:monospace; font-weight:700; color:#fff;
                    border:1px solid #222; }
+    /* Custom CSS tooltip (data-tip) — shows immediately on hover, dark
+       pop-up with arrow, wraps long text. Replaces the slow native title. */
+    .etna-tip { position: relative; display: inline-block; cursor: help; }
+    .etna-tip[data-tip]:hover::after {
+        content: attr(data-tip);
+        position: absolute;
+        left: 50%;
+        bottom: calc(100% + 8px);
+        transform: translateX(-50%);
+        background: #1a1a1a;
+        color: #f0f0f0;
+        padding: 8px 10px;
+        border-radius: 6px;
+        border: 1px solid #444;
+        font-size: 0.82rem;
+        font-weight: 400;
+        line-height: 1.35;
+        white-space: normal;
+        width: max-content;
+        max-width: 320px;
+        z-index: 9999;
+        box-shadow: 0 4px 14px rgba(0,0,0,0.45);
+        pointer-events: none;
+    }
+    .etna-tip[data-tip]:hover::before {
+        content: "";
+        position: absolute;
+        left: 50%;
+        bottom: calc(100% + 2px);
+        transform: translateX(-50%);
+        border: 6px solid transparent;
+        border-top-color: #1a1a1a;
+        z-index: 9999;
+        pointer-events: none;
+    }
+    .kpi-card.etna-tip { display:block; }
+    .kpi-card.etna-tip[data-tip]:hover::after { bottom: calc(100% + 6px); }
+    .label-tip { border-bottom: 1px dotted #888; cursor: help; }
+    /* Allow the absolutely-positioned tooltip to escape Streamlit's
+       column/block containers, which default to overflow:hidden. */
+    [data-testid="stVerticalBlock"],
+    [data-testid="stHorizontalBlock"],
+    [data-testid="column"],
+    [data-testid="stMarkdownContainer"],
+    .stMarkdown,
+    .element-container { overflow: visible !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -122,22 +168,28 @@ KPI_TOOLTIPS = {
 }
 
 
+def _esc_attr(s: str) -> str:
+    return (s.replace("&", "&amp;").replace('"', "&quot;")
+             .replace("<", "&lt;").replace(">", "&gt;"))
+
+
 def render_kpi(slot, label: str, value: str, color: str = "#fff",
                tooltip: str | None = None) -> None:
     if tooltip is None:
         tooltip = KPI_TOOLTIPS.get(label, "")
-    title_attr = f' title="{tooltip}"' if tooltip else ""
+    cls = "kpi-card etna-tip" if tooltip else "kpi-card"
+    tip_attr = f' data-tip="{_esc_attr(tooltip)}"' if tooltip else ""
     slot.markdown(
-        f'<div class="kpi-card"{title_attr}><div class="kpi-lbl">{label}</div>'
+        f'<div class="{cls}"{tip_attr}><div class="kpi-lbl">{label}</div>'
         f'<div class="kpi-val" style="color:{color}">{value}</div></div>',
         unsafe_allow_html=True,
     )
 
 
 def hover_label(text: str, tooltip: str) -> str:
-    """Bold label with a native browser tooltip on hover (HTML title attr)."""
-    return (f'<span title="{tooltip}" style="border-bottom:1px dotted #888;'
-            f'cursor:help;"><strong>{text}</strong></span>')
+    """Bold label with a custom CSS tooltip (.etna-tip[data-tip])."""
+    return (f'<span class="etna-tip label-tip" data-tip="{_esc_attr(tooltip)}">'
+            f'<strong>{text}</strong></span>')
 
 # ---------------------------------------------------------------------------
 # Sidebar controls
