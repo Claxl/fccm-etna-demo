@@ -988,16 +988,17 @@ elif run_clicked:
                 err_img = draw_landmark_error(
                     result.fixed, gt_lm_on_fixed, predicted_lm,
                 )
-                st.image(
-                    annotate(
-                        err_img,
-                        f"GT (green) vs predicted (red) - TRE {result.final_rmse_px:.2f} px",
-                        (0, 255, 0),
-                    ),
-                    channels="BGR", width="stretch",
-                )
 
-                c1, c2 = st.columns([3, 1])
+                c0, c1, c2 = st.columns([2, 3, 1])
+                with c0:
+                    st.image(
+                        annotate(
+                            err_img,
+                            f"GT (green) vs predicted (red) - TRE {result.final_rmse_px:.2f} px",
+                            (0, 255, 0),
+                        ),
+                        channels="BGR", width="stretch",
+                    )
                 with c1:
                     n_lm = len(per_lm)
                     nbins = max(10, min(40, int(np.sqrt(n_lm) * 2)))
