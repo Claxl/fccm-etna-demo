@@ -92,6 +92,52 @@ st.markdown(
     .ladder-cell { border-radius:6px; padding:10px 12px; margin:3px 0;
                    font-family:monospace; font-weight:700; color:#fff;
                    border:1px solid #222; }
+    /* Custom CSS tooltip (data-tip) — shows immediately on hover, dark
+       pop-up with arrow, wraps long text. Replaces the slow native title. */
+    .etna-tip { position: relative; display: inline-block; cursor: help; }
+    .etna-tip[data-tip]:hover::after {
+        content: attr(data-tip);
+        position: absolute;
+        left: 50%;
+        bottom: calc(100% + 8px);
+        transform: translateX(-50%);
+        background: #1a1a1a;
+        color: #f0f0f0;
+        padding: 8px 10px;
+        border-radius: 6px;
+        border: 1px solid #444;
+        font-size: 0.82rem;
+        font-weight: 400;
+        line-height: 1.35;
+        white-space: normal;
+        width: max-content;
+        max-width: 320px;
+        z-index: 9999;
+        box-shadow: 0 4px 14px rgba(0,0,0,0.45);
+        pointer-events: none;
+    }
+    .etna-tip[data-tip]:hover::before {
+        content: "";
+        position: absolute;
+        left: 50%;
+        bottom: calc(100% + 2px);
+        transform: translateX(-50%);
+        border: 6px solid transparent;
+        border-top-color: #1a1a1a;
+        z-index: 9999;
+        pointer-events: none;
+    }
+    .kpi-card.etna-tip { display:block; }
+    .kpi-card.etna-tip[data-tip]:hover::after { bottom: calc(100% + 6px); }
+    .label-tip { border-bottom: 1px dotted #888; cursor: help; }
+    /* Allow the absolutely-positioned tooltip to escape Streamlit's
+       column/block containers, which default to overflow:hidden. */
+    [data-testid="stVerticalBlock"],
+    [data-testid="stHorizontalBlock"],
+    [data-testid="column"],
+    [data-testid="stMarkdownContainer"],
+    .stMarkdown,
+    .element-container { overflow: visible !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -100,6 +146,50 @@ st.markdown(
 st.markdown('<p class="etna-title">ETNA — Hybrid CPU/FPGA Pyramidal Image Registration</p>',
             unsafe_allow_html=True)
 st.markdown('<p class="etna-sub">Live demo • FCCM demo night</p>', unsafe_allow_html=True)
+
+
+KPI_TOOLTIPS = {
+    "Backend": "Compute backend currently in use (FPGA / CPU). Shows 'CPU fallback' when FPGA was requested but unavailable.",
+    "Level": "Active pyramid level and its image size in pixels. L0 is the finest (full-res) level.",
+    "Metric evals": "Number of similarity-metric evaluations performed so far across all pyramid levels.",
+    "Elapsed": "Wall-clock time elapsed since the run started.",
+    "ms / step": "Latest milliseconds spent inside a single similarity-metric evaluation.",
+    "TRE (px)": "Target Registration Error: RMSE of the ground-truth landmark positions, in pixels. Initial → best.",
+    "Power (W)": "Instantaneous FPGA power draw (PMBUS reading).",
+    "QAC": "Quality / Accuracy / Cost figure-of-merit: 100 / (best_TRE_px + power_W).",
+    "CPU Backend": "Parallel CPU run used as a baseline for FPGA speedup comparison.",
+    "CPU Level": "Active pyramid level on the parallel CPU baseline run.",
+    "CPU Evals": "Number of metric evaluations performed by the parallel CPU baseline.",
+    "CPU Elapsed": "Wall-clock time of the parallel CPU baseline run.",
+    "CPU ms/step": "Latest ms / step on the parallel CPU baseline.",
+    "CPU TRE": "Target Registration Error of the parallel CPU baseline.",
+    "CPU Power (W)": "CPU socket power consumption during the baseline run.",
+    "CPU QAC": "QAC figure-of-merit on the parallel CPU baseline.",
+}
+
+
+def _esc_attr(s: str) -> str:
+    return (s.replace("&", "&amp;").replace('"', "&quot;")
+             .replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def render_kpi(slot, label: str, value: str, color: str = "#fff",
+               tooltip: str | None = None) -> None:
+    if tooltip is None:
+        tooltip = KPI_TOOLTIPS.get(label, "")
+    cls = "kpi-card etna-tip" if tooltip else "kpi-card"
+    tip_attr = f' data-tip="{_esc_attr(tooltip)}"' if tooltip else ""
+    slot.markdown(
+        f'<div class="{cls}"{tip_attr}><div class="kpi-lbl">{label}</div>'
+        f'<div class="kpi-val" style="color:{color}">{value}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def hover_label(text: str, tooltip: str) -> str:
+    """Bold label with a custom CSS tooltip (.etna-tip[data-tip])."""
+    return (f'<span class="etna-tip label-tip" data-tip="{_esc_attr(tooltip)}">'
+            f'<strong>{text}</strong></span>')
 
 # ---------------------------------------------------------------------------
 # Sidebar controls
@@ -260,17 +350,29 @@ moving_img = load_image(moving_path, target_size=ref_size)
 st.subheader("Inputs & live overlay")
 top_cols = st.columns(3)
 with top_cols[0]:
-    st.markdown("**Fixed**")
+    st.markdown(
+        hover_label("Fixed",
+                    "Reference image. Stays still — the moving image is warped onto its grid."),
+        unsafe_allow_html=True,
+    )
     fixed_slot = st.empty()
     fixed_slot.image(annotate(fixed_img, f"Fixed - {fixed_path.name}", (180, 180, 180)),
                      channels="BGR", width="stretch")
 with top_cols[1]:
-    st.markdown("**Moving**")
+    st.markdown(
+        hover_label("Moving",
+                    "Image being registered onto the fixed image via an affine transform."),
+        unsafe_allow_html=True,
+    )
     moving_slot = st.empty()
     moving_slot.image(annotate(moving_img, f"Moving - {moving_path.name}", (0, 128, 255)),
                       channels="BGR", width="stretch")
 with top_cols[2]:
-    st.markdown("**Live overlay**")
+    st.markdown(
+        hover_label("Live overlay",
+                    "Fused fixed ⊕ warped(moving) using the current optimizer estimate. Updated every few evals."),
+        unsafe_allow_html=True,
+    )
     overlay_slot = st.empty()
     overlay_slot.image(
         annotate(make_fusion(fixed_img, moving_img), "initial overlay", (0, 0, 255)),
@@ -282,18 +384,43 @@ st.subheader("Convergence telemetry")
 mid_cols = st.columns([1, 2, 2])
 
 with mid_cols[0]:
-    st.markdown("**Pyramid ladder**")
+    st.markdown(
+        hover_label("Pyramid ladder",
+                    "Coarse-to-fine resolution levels. Highlighted cell = level the optimizer is currently working at."),
+        unsafe_allow_html=True,
+    )
     ladder_slot = st.empty()
-    st.markdown("**Transform (2×3)**")
+    st.markdown(
+        hover_label("Transform (2×3)",
+                    "Current 2×3 affine matrix [a b tx; c d ty]. Maps moving → fixed."),
+        unsafe_allow_html=True,
+    )
     matrix_slot = st.empty()
 with mid_cols[1]:
-    st.markdown("**Similarity metric — live**")
+    st.markdown(
+        hover_label("Similarity metric — live",
+                    "Per-eval similarity score (MI / MSE / CC), one trace per pyramid level."),
+        unsafe_allow_html=True,
+    )
     curve_slot = st.empty()
 with mid_cols[2]:
-    st.markdown("**Landmark RMSE vs ground truth — live**")
+    st.markdown(
+        hover_label("Landmark TRE vs ground truth — live",
+                    "Target Registration Error (px) at each metric eval, computed from .mat ground-truth landmarks."),
+        unsafe_allow_html=True,
+    )
     rmse_slot = st.empty()
 
 st.markdown("---")
+
+# Title above the FPGA KPI row when comparing FPGA vs CPU side-by-side.
+if compare_mode and device == "FPGA":
+    st.markdown(
+        '<div style="color:#cfd8dc;font-size:1.05rem;font-weight:500;'
+        'letter-spacing:0.5px;margin:4px 0 6px 2px;">FPGA</div>',
+        unsafe_allow_html=True,
+    )
+
 kpi_cols = st.columns(8)
 backend_slot = kpi_cols[0].empty()
 level_slot = kpi_cols[1].empty()
@@ -330,14 +457,6 @@ def render_matrix(h: np.ndarray | None) -> str:
     return f"<pre style='color:#fff;font-size:1.05rem'>{body}</pre>"
 
 
-def render_kpi(slot, label: str, value: str, color: str = "#fff") -> None:
-    slot.markdown(
-        f'<div class="kpi-card"><div class="kpi-lbl">{label}</div>'
-        f'<div class="kpi-val" style="color:{color}">{value}</div></div>',
-        unsafe_allow_html=True,
-    )
-
-
 # Initial state for the live slots.
 ladder_slot.markdown(render_ladder(-1, num_levels), unsafe_allow_html=True)
 matrix_slot.markdown(render_matrix(np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)),
@@ -354,7 +473,7 @@ curve_slot.plotly_chart(_init_fig, width="stretch")
 _init_rmse = go.Figure()
 _init_rmse.update_layout(
     template="plotly_dark", height=300, margin=dict(l=10, r=10, t=20, b=30),
-    xaxis_title="metric eval #", yaxis_title="RMSE (px)",
+    xaxis_title="metric eval #", yaxis_title="TRE (px)",
     showlegend=True, legend=dict(orientation="h", y=-0.2),
 )
 if gt_path is None:
@@ -372,7 +491,7 @@ render_kpi(level_slot, "Level", "—")
 render_kpi(eval_slot, "Metric evals", "0")
 render_kpi(time_slot, "Elapsed", "0.0 s")
 render_kpi(rate_slot, "ms / step", "—")
-render_kpi(rmse_kpi_slot, "RMSE (px)", "— / —")
+render_kpi(rmse_kpi_slot, "TRE (px)", "— / —")
 render_kpi(power_slot, "Power (W)", "—")
 render_kpi(qac_slot, "QAC", "—")
 
@@ -479,7 +598,11 @@ def _run_and_stream(compare: bool = False, replay_path: str | None = None):
             gt_mat_path=str(gt_path) if gt_path is not None else None,
             num_pyramid_levels=num_levels,
         )
-        st.markdown("##### FPGA vs CPU live comparison")
+        st.markdown(
+            '<div style="color:#cfd8dc;font-size:1.05rem;font-weight:500;'
+            'letter-spacing:0.5px;margin:10px 0 6px 2px;">CPU</div>',
+            unsafe_allow_html=True,
+        )
         _cpu_cols = st.columns(8)
         cpu_kpi["backend"] = _cpu_cols[0].empty()
         cpu_kpi["level"]   = _cpu_cols[1].empty()
@@ -494,7 +617,7 @@ def _run_and_stream(compare: bool = False, replay_path: str | None = None):
         render_kpi(cpu_kpi["eval"],    "CPU Evals",   "0")
         render_kpi(cpu_kpi["time"],    "CPU Elapsed", "—")
         render_kpi(cpu_kpi["rate"],    "CPU ms/step", "—")
-        render_kpi(cpu_kpi["rmse"],    "CPU RMSE",    "—")
+        render_kpi(cpu_kpi["rmse"],    "CPU TRE",     "—")
         render_kpi(cpu_kpi["power"],   "CPU Power (W)", "—")
         render_kpi(cpu_kpi["qac"],     "CPU QAC",     "—")
 
@@ -637,7 +760,7 @@ def _run_and_stream(compare: bool = False, replay_path: str | None = None):
             rmse_fig.update_layout(
                 template="plotly_dark", height=300,
                 margin=dict(l=10, r=10, t=20, b=30),
-                xaxis_title="metric eval #", yaxis_title="RMSE (px)",
+                xaxis_title="metric eval #", yaxis_title="TRE (px)",
                 showlegend=True, legend=dict(orientation="h", y=-0.2),
             )
             rmse_slot.plotly_chart(rmse_fig, width="stretch")
@@ -657,11 +780,11 @@ def _run_and_stream(compare: bool = False, replay_path: str | None = None):
         if snap.initial_rmse is not None and snap.best_rmse != float("inf"):
             delta_colour = ("#27ae60" if snap.best_rmse < snap.initial_rmse
                             else "#e74c3c")
-            render_kpi(rmse_kpi_slot, "RMSE (px)",
+            render_kpi(rmse_kpi_slot, "TRE (px)",
                        f"{snap.initial_rmse:.1f} → {snap.best_rmse:.2f}",
                        delta_colour)
         elif snap.initial_rmse is not None:
-            render_kpi(rmse_kpi_slot, "RMSE (px)",
+            render_kpi(rmse_kpi_slot, "TRE (px)",
                        f"{snap.initial_rmse:.1f} → …", "#f39c12")
         if snap.current_power_w is not None:
             render_kpi(power_slot, "Power (W)", f"{snap.current_power_w / 1_000_000:.2f}")
@@ -687,7 +810,7 @@ def _run_and_stream(compare: bool = False, replay_path: str | None = None):
             if cpu_snap.initial_rmse is not None and cpu_snap.best_rmse != float("inf"):
                 delta_col = ("#27ae60" if cpu_snap.best_rmse < cpu_snap.initial_rmse
                              else "#e74c3c")
-                render_kpi(cpu_kpi["rmse"], "CPU RMSE",
+                render_kpi(cpu_kpi["rmse"], "CPU TRE",
                            f"{cpu_snap.initial_rmse:.1f}→{cpu_snap.best_rmse:.2f}",
                            delta_col)
             if cpu_snap.current_power_w is not None:
@@ -799,12 +922,15 @@ elif run_clicked:
 
             if result.initial_rmse_px is not None and result.final_rmse_px is not None:
                 rc = st.columns(3)
-                rc[0].metric("Initial RMSE", f"{result.initial_rmse_px:.2f} px")
-                rc[1].metric("Final RMSE", f"{result.final_rmse_px:.2f} px",
+                rc[0].metric("Initial TRE", f"{result.initial_rmse_px:.2f} px",
+                             help="Target Registration Error before any optimization (identity transform)")
+                rc[1].metric("Final TRE", f"{result.final_rmse_px:.2f} px",
                              delta=f"{result.final_rmse_px - result.initial_rmse_px:+.2f}",
-                             delta_color="inverse")
+                             delta_color="inverse",
+                             help="Target Registration Error after registration. We retain the best TRE seen during the run.")
                 improvement = (1.0 - result.final_rmse_px / max(result.initial_rmse_px, 1e-6)) * 100
-                rc[2].metric("Improvement", f"{improvement:.1f} %")
+                rc[2].metric("Improvement", f"{improvement:.1f} %",
+                             help="Reduction of the TRE relative to the initial value.")
 
             # CPU-vs-FPGA speedup panel (only if both backends have been run).
             cached = st.session_state.runs.get(pair_name, {})
@@ -855,35 +981,78 @@ elif run_clicked:
                 from etna_runner import _apply_affine_2x3 as _aff
                 predicted_lm = _aff(result.landmarks_mov_scaled, result.transform)
                 gt_lm_on_fixed = _aff(result.landmarks_mov_scaled, result.gt_transform_ref)
+                # Per-landmark pixel error: ||H_est @ p - T_gt @ p||.
+                per_lm = np.linalg.norm(predicted_lm - gt_lm_on_fixed, axis=1)
+
+                # Landmark visualization image (GT in green, predicted in red).
                 err_img = draw_landmark_error(
                     result.fixed, gt_lm_on_fixed, predicted_lm,
                 )
-                c1, c2 = st.columns([2, 1])
+
+                c0, c1, c2 = st.columns([2, 3, 1])
+                with c0:
+                    st.image(
+                        annotate(
+                            err_img,
+                            f"GT (green) vs predicted (red) - TRE {result.final_rmse_px:.2f} px",
+                            (0, 255, 0),
+                        ),
+                        channels="BGR", width="stretch",
+                    )
                 with c1:
-                    st.image(annotate(err_img,
-                                      f"GT (green) vs predicted (red) - RMSE {result.final_rmse_px:.2f} px",
-                                      (0, 255, 0)),
-                             channels="BGR", width="stretch")
-                with c2:
-                    st.metric("Landmarks", f"{len(result.landmarks_mov_scaled)}")
-                    st.metric("Initial RMSE",
-                              f"{result.initial_rmse_px:.2f} px"
-                              if result.initial_rmse_px is not None else "—")
-                    st.metric("Final RMSE",
-                              f"{result.final_rmse_px:.2f} px"
-                              if result.final_rmse_px is not None else "—")
-                    # Per-landmark error histogram: ||H @ p - T_gt @ p||.
-                    per_lm = np.linalg.norm(predicted_lm - gt_lm_on_fixed, axis=1)
-                    hist_fig = go.Figure(data=[go.Histogram(x=per_lm, nbinsx=20,
-                                                            marker_color="#3498db")])
+                    n_lm = len(per_lm)
+                    nbins = max(10, min(40, int(np.sqrt(n_lm) * 2)))
+                    median_err = float(np.median(per_lm))
+                    p95_err = float(np.percentile(per_lm, 95))
+                    max_err = float(per_lm.max())
+                    hist_fig = go.Figure(data=[go.Histogram(
+                        x=per_lm, nbinsx=nbins,
+                        marker_color="#3498db",
+                        marker_line_color="#1f6391",
+                        marker_line_width=1,
+                        hovertemplate="error: %{x:.2f} px<br>count: %{y}<extra></extra>",
+                    )])
+                    hist_fig.add_vline(
+                        x=result.final_rmse_px, line_dash="dash",
+                        line_color="#e74c3c",
+                        annotation_text=f"TRE (RMS) = {result.final_rmse_px:.2f} px",
+                        annotation_position="top right",
+                    )
+                    hist_fig.add_vline(
+                        x=median_err, line_dash="dot", line_color="#27ae60",
+                        annotation_text=f"median = {median_err:.2f} px",
+                        annotation_position="top left",
+                    )
                     hist_fig.update_layout(
-                        template="plotly_dark", height=220,
-                        margin=dict(l=10, r=10, t=20, b=30),
-                        xaxis_title="per-landmark error (px)",
+                        template="plotly_dark", height=440,
+                        margin=dict(l=10, r=10, t=40, b=40),
+                        title=dict(
+                            text=f"Per-landmark pixel error — {n_lm} ground-truth points",
+                            font=dict(size=14),
+                        ),
+                        xaxis_title="landmark error (px)",
                         yaxis_title="count",
+                        bargap=0.05,
                     )
                     st.plotly_chart(hist_fig, width="stretch",
                                     key="per-lm-hist")
+                with c2:
+                    st.metric("Landmarks", f"{len(result.landmarks_mov_scaled)}",
+                              help="Number of ground-truth landmark points used to compute the TRE.")
+                    st.metric("Initial TRE",
+                              f"{result.initial_rmse_px:.2f} px"
+                              if result.initial_rmse_px is not None else "—",
+                              help="Target Registration Error before optimization.")
+                    st.metric("Final TRE",
+                              f"{result.final_rmse_px:.2f} px"
+                              if result.final_rmse_px is not None else "—",
+                              help="Target Registration Error of the best estimate retained.")
+                    st.metric("Median error", f"{median_err:.2f} px",
+                              help="Median per-landmark pixel error.")
+                    st.metric("95th pct", f"{p95_err:.2f} px",
+                              help="95th percentile of per-landmark pixel error.")
+                    st.metric("Max error", f"{max_err:.2f} px",
+                              help="Worst-case landmark error.")
 else:
     st.caption("Pick a pair in the sidebar and hit **Run ETNA** to start the live demo.")
 
@@ -942,12 +1111,12 @@ def _render_layer_detail(level: int) -> None:
         rfig.update_layout(
             template="plotly_dark", height=240,
             margin=dict(l=10, r=10, t=20, b=30),
-            xaxis_title="metric eval #", yaxis_title="RMSE (px)",
+            xaxis_title="metric eval #", yaxis_title="TRE (px)",
             showlegend=False,
         )
         st.plotly_chart(rfig, width="stretch", key=f"detail-rmse-{level}")
     else:
-        st.caption("No ground-truth RMSE available for this layer.")
+        st.caption("No ground-truth TRE available for this layer.")
 
     st.markdown("**Transform at end of layer (2×3)**")
     st.markdown(render_matrix(info.get("final_transform")), unsafe_allow_html=True)

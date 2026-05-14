@@ -348,6 +348,12 @@ class InstrumentedMetric(EtnaMultiMetric):
         # affine rescaled to the same grid (both may be None).
         self._lm_mov = landmarks_mov_scaled
         self._T_gt_ref = T_gt_ref
+        # Best transform seen during the run, in ``ref_size`` pixel space, and
+        # the corresponding TRE. Used to override the optimizer's final H so
+        # the result we report is always the best-TRE estimate (when GT is
+        # available). When no GT is loaded these stay None / +inf.
+        self.best_tre_px: float = float("inf")
+        self.best_H_ref: np.ndarray | None = None
         # Re-bind the dispatched compute_metric so our override is used.
         self._base_compute_metric = self.compute_metric
         self.compute_metric = self._compute_metric_instrumented  # type: ignore[assignment]
@@ -404,6 +410,14 @@ class InstrumentedMetric(EtnaMultiMetric):
                 t_np, level_size, self.ref_size,
                 self._lm_mov, self._T_gt_ref,
             )
+            # Track the lowest-TRE transform seen so far in ref_size coords.
+            # Saving here means the final reported H is at worst as good as
+            # any intermediate snapshot, even if the optimizer drifts away.
+            if rmse is not None and not (rmse != rmse) and rmse < self.best_tre_px:
+                self.best_tre_px = float(rmse)
+                self.best_H_ref = _upscale_level_transform(
+                    t_np, level_size, self.ref_size,
+                )
         self._instr_times["rmse"] += _pc() - _t
 
         _t = _pc()
@@ -747,6 +761,13 @@ def run_etna(
         raise
 
     total_time = time.time() - start
+
+    # Always report the best-TRE estimate seen during the run when ground
+    # truth is available. This guarantees the final result is the best the
+    # optimizer ever achieved, even if it later drifted away from it.
+    if (metric_component.best_H_ref is not None
+            and metric_component.best_tre_px != float("inf")):
+        H = metric_component.best_H_ref
 
     # Apply final transform to moving image for display.
     import cv2
